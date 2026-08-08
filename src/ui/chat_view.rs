@@ -14,6 +14,10 @@ use crate::ui::widgets::pane;
 /// A pause at least this long starts a new sender header even within one sender's run.
 const GROUP_GAP_MINUTES: i64 = 5;
 
+/// Width of the `HH:MM ` stamp that precedes a sender name. Message bodies are indented by
+/// exactly this much so they line up with the name rather than with the timestamp.
+const TIME_WIDTH: usize = 6;
+
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let [transcript_area, compose_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
@@ -77,8 +81,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn build_lines(buffer: &ChatBuffer, width: usize) -> Vec<Line<'static>> {
-    // Two columns of indent for message bodies, so senders stand out.
-    let body_width = width.saturating_sub(2);
+    // Bodies hang under the sender name, past the timestamp column.
+    let body_width = width.saturating_sub(TIME_WIDTH);
     let mut lines = Vec::new();
 
     if buffer.loading_older {
@@ -107,7 +111,7 @@ fn build_lines(buffer: &ChatBuffer, width: usize) -> Vec<Line<'static>> {
 
             lines.push(Line::from(vec![
                 Span::styled(
-                    message.local_time().format("%H:%M ").to_string(),
+                    format!("{:<TIME_WIDTH$}", message.local_time().format("%H:%M")),
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(who, who_style),
@@ -115,7 +119,7 @@ fn build_lines(buffer: &ChatBuffer, width: usize) -> Vec<Line<'static>> {
         }
 
         for line in wrap(&message.text, body_width) {
-            lines.push(Line::from(format!("  {line}")));
+            lines.push(Line::from(format!("{:TIME_WIDTH$}{line}", "")));
         }
         previous = Some(message);
     }
@@ -237,6 +241,25 @@ mod tests {
         // 1 header + 5 bodies. There is no start-of-conversation marker because more
         // history remains, so the ungrouped rendering would have cost 4 extra lines.
         assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn a_body_starts_in_the_same_column_as_the_sender_name() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        buffer.set_initial(vec![]);
+        buffer.messages.push_back(at(1, Some("Alice"), false, 0));
+
+        let lines = build_lines(&buffer, 40);
+        let header = &lines[lines.len() - 2];
+        let body = lines.last().unwrap().to_string();
+
+        let name_column: usize = header.spans[..1].iter().map(|s| s.content.len()).sum();
+        assert_eq!(
+            body.len() - body.trim_start().len(),
+            name_column,
+            "the body indent must match the width of the timestamp, or wrapped text \
+             hangs under the clock instead of under the name"
+        );
     }
 
     #[test]
