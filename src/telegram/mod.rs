@@ -282,7 +282,6 @@ impl Actor {
             }
         });
     }
-
 }
 
 /// Fetch one page of history, newest first. `before_id` pages backwards through the chat.

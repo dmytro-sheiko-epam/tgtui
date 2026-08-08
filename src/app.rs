@@ -24,7 +24,9 @@ pub enum Screen {
     Connecting,
     Phone,
     Code,
-    Password { hint: Option<String> },
+    Password {
+        hint: Option<String>,
+    },
     Main,
 }
 
@@ -34,9 +36,17 @@ pub enum Focus {
     Messages,
 }
 
+/// Whether a status line reports a problem or just narrates progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Info,
+    Error,
+}
+
 #[derive(Debug)]
 pub struct Status {
     pub text: String,
+    pub kind: StatusKind,
     shown_at: Instant,
 }
 
@@ -98,9 +108,10 @@ impl App {
         }
     }
 
-    fn set_status(&mut self, text: impl Into<String>) {
+    fn set_status(&mut self, text: impl Into<String>, kind: StatusKind) {
         self.status = Some(Status {
             text: text.into(),
+            kind,
             shown_at: Instant::now(),
         });
     }
@@ -151,7 +162,7 @@ impl App {
                 self.screen = Screen::Password { hint };
             }
             TgEvent::SignedIn { name } => {
-                self.set_status(format!("signed in as {name}"));
+                self.set_status(format!("signed in as {name}"), StatusKind::Info);
                 self.enter_main();
             }
             TgEvent::LoginFailed(error) => {
@@ -209,7 +220,7 @@ impl App {
                     self.screen = Screen::Phone;
                     self.login_error = Some(error);
                 } else {
-                    self.set_status(error);
+                    self.set_status(error, StatusKind::Error);
                 }
             }
         }
@@ -402,5 +413,353 @@ impl App {
 
         self.compose.clear();
         self.send(TgCommand::SendMessage { peer, text });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::chat_buffer::PAGE_SIZE;
+    use crate::telegram::TgEvent;
+    use crate::test_support::{app, dialog, drain, message, page, peer};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Drive a fresh app to the point where chat 1 is open with a full page loaded.
+    fn opened_chat() -> (App, mpsc::UnboundedReceiver<TgCommand>) {
+        let (mut app, mut rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![dialog(1, "Alice"), dialog(2, "Bob")],
+            exhausted: true,
+        });
+        app.handle_event(TgEvent::MessagesLoaded {
+            peer: peer(1).id,
+            messages: page(100, PAGE_SIZE as i32),
+        });
+        drain(&mut rx);
+        (app, rx)
+    }
+
+    #[test]
+    fn startup_asks_whether_the_saved_session_still_works() {
+        let (_app, mut rx) = app();
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::CheckAuthorized]
+        ));
+    }
+
+    #[test]
+    fn a_valid_session_skips_login_and_loads_chats() {
+        let (mut app, mut rx) = app();
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::Authorized(true));
+
+        assert!(matches!(app.screen, Screen::Main));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::LoadMoreDialogs]
+        ));
+    }
+
+    #[test]
+    fn login_walks_phone_then_code_then_password() {
+        let (mut app, mut rx) = app();
+        app.handle_event(TgEvent::Authorized(false));
+        assert!(matches!(app.screen, Screen::Phone));
+
+        app.input = "+15551234567".to_string();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_event(TgEvent::CodeSent);
+        assert!(matches!(app.screen, Screen::Code));
+
+        app.input = "12345".to_string();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_event(TgEvent::PasswordNeeded {
+            hint: Some("pet".to_string()),
+        });
+        assert!(matches!(app.screen, Screen::Password { .. }));
+
+        app.input = "hunter2".to_string();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_event(TgEvent::SignedIn {
+            name: "Alice".to_string(),
+        });
+        assert!(matches!(app.screen, Screen::Main));
+
+        let commands = drain(&mut rx);
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                TgCommand::CheckAuthorized,
+                TgCommand::RequestLoginCode { .. },
+                TgCommand::SignIn { .. },
+                TgCommand::CheckPassword { .. },
+                TgCommand::LoadMoreDialogs,
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_rejected_code_keeps_the_screen_so_it_can_be_retyped() {
+        let (mut app, _rx) = app();
+        app.handle_event(TgEvent::Authorized(false));
+        app.input = "+15551234567".to_string();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_event(TgEvent::CodeSent);
+
+        app.input = "00000".to_string();
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_event(TgEvent::LoginFailed("that code was not valid".to_string()));
+
+        assert!(matches!(app.screen, Screen::Code));
+        assert_eq!(app.login_error.as_deref(), Some("that code was not valid"));
+        assert!(!app.submitting, "the screen must accept another attempt");
+    }
+
+    #[test]
+    fn a_failed_startup_check_falls_through_to_the_phone_prompt() {
+        let (mut app, _rx) = app();
+        assert!(matches!(app.screen, Screen::Connecting));
+
+        app.handle_event(TgEvent::Error("could not reach Telegram".to_string()));
+
+        assert!(
+            matches!(app.screen, Screen::Phone),
+            "a network failure must not strand the user on the connecting screen"
+        );
+        assert!(app.login_error.is_some());
+    }
+
+    #[test]
+    fn the_first_chat_opens_as_soon_as_the_list_arrives() {
+        let (mut app, mut rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![dialog(1, "Alice")],
+            exhausted: false,
+        });
+
+        assert_eq!(app.open_chat, Some(peer(1).id));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::OpenChat { .. }]
+        ));
+    }
+
+    #[test]
+    fn revisiting_a_chat_reuses_the_cached_buffer() {
+        let (mut app, mut rx) = opened_chat();
+
+        app.handle_key(key(KeyCode::Down)); // to Bob
+        app.handle_event(TgEvent::MessagesLoaded {
+            peer: peer(2).id,
+            messages: page(10, 2),
+        });
+        drain(&mut rx);
+
+        app.handle_key(key(KeyCode::Up)); // back to Alice
+
+        assert_eq!(app.open_chat, Some(peer(1).id));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a cached chat must not be re-fetched"
+        );
+    }
+
+    #[test]
+    fn scrolling_near_the_top_asks_for_older_messages_exactly_once() {
+        let (mut app, mut rx) = opened_chat();
+        app.focus = Focus::Messages;
+        // Stand in for a render: 100 lines of transcript in a 20 line viewport.
+        app.metrics = ChatViewMetrics {
+            total_lines: 100,
+            viewport: 20,
+        };
+
+        // One page up is still far from the top (scroll 20, top is 80).
+        app.handle_key(key(KeyCode::PageUp));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "must not prefetch from the middle of the transcript"
+        );
+
+        // Keep going until the top is within the prefetch margin.
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::PageUp));
+        }
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(commands.as_slice(), [TgCommand::LoadOlderMessages { before_id, .. }] if *before_id == 51),
+            "expected one request offset at the oldest held message, got {commands:?}"
+        );
+
+        // Scrolling again while that request is in flight must not queue a duplicate.
+        app.handle_key(key(KeyCode::PageUp));
+        assert!(drain(&mut rx).is_empty(), "the in-flight guard must hold");
+    }
+
+    #[test]
+    fn older_messages_extend_the_buffer_without_moving_the_viewport() {
+        let (mut app, _rx) = opened_chat();
+        app.focus = Focus::Messages;
+        app.metrics = ChatViewMetrics {
+            total_lines: 100,
+            viewport: 20,
+        };
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::PageUp));
+        }
+        let scroll_before = app.open_buffer().unwrap().scroll;
+
+        app.handle_event(TgEvent::OlderMessagesLoaded {
+            peer: peer(1).id,
+            messages: page(50, 10),
+        });
+
+        let buffer = app.open_buffer().unwrap();
+        assert_eq!(buffer.messages.len(), PAGE_SIZE + 10);
+        assert_eq!(buffer.oldest_id(), Some(41));
+        assert!(!buffer.loading_older);
+        assert_eq!(
+            buffer.scroll, scroll_before,
+            "the offset counts from the bottom, so prepending must not move the view"
+        );
+    }
+
+    #[test]
+    fn reaching_the_start_of_history_stops_further_requests() {
+        let (mut app, mut rx) = opened_chat();
+        app.focus = Focus::Messages;
+        app.metrics = ChatViewMetrics {
+            total_lines: 100,
+            viewport: 20,
+        };
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::PageUp));
+        }
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::OlderMessagesLoaded {
+            peer: peer(1).id,
+            messages: Vec::new(),
+        });
+        app.handle_key(key(KeyCode::PageUp));
+
+        assert!(!app.open_buffer().unwrap().has_more_older);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "must stop asking once history is exhausted"
+        );
+    }
+
+    #[test]
+    fn typing_and_pressing_enter_sends_the_message() {
+        let (mut app, mut rx) = opened_chat();
+        app.focus = Focus::Messages;
+
+        for ch in "hi there".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Enter));
+
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(commands.as_slice(), [TgCommand::SendMessage { text, peer: p }]
+                if text == "hi ther" && p.id == peer(1).id),
+            "got {commands:?}"
+        );
+        assert!(app.compose.is_empty(), "the box clears optimistically");
+    }
+
+    #[test]
+    fn an_empty_compose_box_sends_nothing() {
+        let (mut app, mut rx) = opened_chat();
+        app.focus = Focus::Messages;
+
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_sent_message_appears_once_despite_the_update_echo() {
+        let (mut app, _rx) = opened_chat();
+        let sent = message(101, "hi there");
+
+        app.handle_event(TgEvent::MessageSent {
+            peer: peer(1).id,
+            message: sent.clone(),
+        });
+        // The update stream reports the same message moments later.
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(1),
+            message: sent,
+            edited: false,
+        });
+
+        let buffer = app.open_buffer().unwrap();
+        assert_eq!(buffer.messages.iter().filter(|m| m.id == 101).count(), 1);
+        assert_eq!(app.dialogs.items[0].preview, "hi there");
+    }
+
+    #[test]
+    fn an_edit_replaces_the_message_in_place() {
+        let (mut app, _rx) = opened_chat();
+        let before = app.open_buffer().unwrap().messages.len();
+
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(1),
+            message: message(100, "edited text"),
+            edited: true,
+        });
+
+        let buffer = app.open_buffer().unwrap();
+        assert_eq!(buffer.messages.len(), before, "an edit must not add a row");
+        assert_eq!(
+            buffer.messages.iter().find(|m| m.id == 100).unwrap().text,
+            "edited text"
+        );
+    }
+
+    #[test]
+    fn errors_and_progress_are_distinguishable_in_the_banner() {
+        let (mut app, _rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+
+        app.handle_event(TgEvent::Error("could not send message".to_string()));
+        let status = app.status.as_ref().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert_eq!(status.text, "could not send message");
+
+        app.handle_event(TgEvent::SignedIn {
+            name: "Alice".to_string(),
+        });
+        assert_eq!(app.status.as_ref().unwrap().kind, StatusKind::Info);
+    }
+
+    #[test]
+    fn scrolling_down_never_runs_past_the_newest_message() {
+        let (mut app, _rx) = opened_chat();
+        app.focus = Focus::Messages;
+        app.metrics = ChatViewMetrics {
+            total_lines: 100,
+            viewport: 20,
+        };
+
+        app.handle_key(key(KeyCode::PageUp));
+        for _ in 0..10 {
+            app.handle_key(key(KeyCode::PageDown));
+        }
+
+        assert_eq!(app.open_buffer().unwrap().scroll, 0);
     }
 }

@@ -7,9 +7,12 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, ChatViewMetrics, Focus};
-use crate::state::chat_buffer::ChatBuffer;
+use crate::state::chat_buffer::{ChatBuffer, ChatMessage};
 use crate::ui::text::wrap;
 use crate::ui::widgets::pane;
+
+/// A pause at least this long starts a new sender header even within one sender's run.
+const GROUP_GAP_MINUTES: i64 = 5;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let [transcript_area, compose_area] =
@@ -90,30 +93,45 @@ fn build_lines(buffer: &ChatBuffer, width: usize) -> Vec<Line<'static>> {
         )));
     }
 
+    let mut previous: Option<&ChatMessage> = None;
     for message in &buffer.messages {
-        let (who, who_style) = if message.outgoing {
-            ("you".to_string(), Style::default().fg(Color::Green).bold())
-        } else {
-            (
-                message.sender.clone().unwrap_or_else(|| "—".to_string()),
-                Style::default().fg(Color::Cyan).bold(),
-            )
-        };
+        if starts_new_group(previous, message) {
+            let (who, who_style) = if message.outgoing {
+                ("you".to_string(), Style::default().fg(Color::Green).bold())
+            } else {
+                (
+                    message.sender.clone().unwrap_or_else(|| "—".to_string()),
+                    Style::default().fg(Color::Cyan).bold(),
+                )
+            };
 
-        lines.push(Line::from(vec![
-            Span::styled(
-                message.local_time().format("%H:%M ").to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(who, who_style),
-        ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    message.local_time().format("%H:%M ").to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(who, who_style),
+            ]));
+        }
 
         for line in wrap(&message.text, body_width) {
             lines.push(Line::from(format!("  {line}")));
         }
+        previous = Some(message);
     }
 
     lines
+}
+
+/// A run of messages from one sender shares a single header, the way chat clients group them.
+/// A long enough pause starts a new group so the timestamp stays useful.
+fn starts_new_group(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous.outgoing != message.outgoing
+        || previous.sender != message.sender
+        || (message.date - previous.date).num_minutes().abs() >= GROUP_GAP_MINUTES
 }
 
 fn render_compose(frame: &mut Frame, area: Rect, app: &App) {
@@ -146,5 +164,93 @@ fn render_compose(frame: &mut Frame, area: Rect, app: &App) {
             area.x + 1 + app.compose.chars().count() as u16,
             area.y + 1,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeDelta;
+
+    use super::*;
+    use crate::test_support::{message, page, peer};
+
+    fn at(id: i32, sender: Option<&str>, outgoing: bool, minute: i64) -> ChatMessage {
+        ChatMessage {
+            id,
+            outgoing,
+            sender: sender.map(str::to_string),
+            text: format!("message {id}"),
+            date: message(id, "").date + TimeDelta::minutes(minute),
+        }
+    }
+
+    #[test]
+    fn the_first_message_always_gets_a_header() {
+        assert!(starts_new_group(None, &at(1, Some("Alice"), false, 0)));
+    }
+
+    #[test]
+    fn a_run_from_one_sender_shares_a_single_header() {
+        let first = at(1, Some("Alice"), false, 0);
+        let second = at(2, Some("Alice"), false, 1);
+        assert!(!starts_new_group(Some(&first), &second));
+    }
+
+    #[test]
+    fn a_different_sender_starts_a_new_group() {
+        let alice = at(1, Some("Alice"), false, 0);
+        let bob = at(2, Some("Bob"), false, 1);
+        assert!(starts_new_group(Some(&alice), &bob));
+    }
+
+    #[test]
+    fn your_own_reply_starts_a_new_group() {
+        // Same display name would otherwise merge an incoming message with your reply.
+        let theirs = at(1, Some("Alice"), false, 0);
+        let mine = at(2, Some("Alice"), true, 1);
+        assert!(starts_new_group(Some(&theirs), &mine));
+    }
+
+    #[test]
+    fn a_long_pause_starts_a_new_group_so_the_time_stays_useful() {
+        let earlier = at(1, Some("Alice"), false, 0);
+        let later = at(2, Some("Alice"), false, GROUP_GAP_MINUTES);
+        assert!(starts_new_group(Some(&earlier), &later));
+    }
+
+    #[test]
+    fn grouping_removes_the_repeated_headers() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        // The fixture's messages all share a sender and timestamp, so they form one group.
+        buffer.set_initial(page(10, 5));
+
+        let lines = build_lines(&buffer, 40);
+        let headers = lines
+            .iter()
+            .filter(|line| line.spans.iter().any(|s| s.content.contains("Alice")))
+            .count();
+
+        assert_eq!(
+            headers, 1,
+            "5 messages from one sender need only one header"
+        );
+        // 1 header + 5 bodies. There is no start-of-conversation marker because more
+        // history remains, so the ungrouped rendering would have cost 4 extra lines.
+        assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn a_message_sent_much_later_gets_its_own_header() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        buffer.set_initial(vec![]);
+        buffer.messages.push_back(at(1, Some("Alice"), false, 0));
+        buffer.messages.push_back(at(2, Some("Alice"), false, 60));
+
+        let headers = build_lines(&buffer, 40)
+            .iter()
+            .filter(|line| line.spans.iter().any(|s| s.content.contains("Alice")))
+            .count();
+
+        assert_eq!(headers, 2);
     }
 }

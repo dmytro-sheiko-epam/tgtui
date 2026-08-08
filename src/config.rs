@@ -29,7 +29,8 @@ impl Config {
                 .map_err(|_| eyre!("TG_API_ID must be an integer, got {raw:?}"))?,
             Err(_) => DEFAULT_API_ID,
         };
-        let api_hash = std::env::var("TG_API_HASH").unwrap_or_else(|_| DEFAULT_API_HASH.to_string());
+        let api_hash =
+            std::env::var("TG_API_HASH").unwrap_or_else(|_| DEFAULT_API_HASH.to_string());
 
         let dirs = ProjectDirs::from("", "", "tgtui")
             .ok_or_else(|| eyre!("could not determine a home directory for the session file"))?;

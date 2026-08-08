@@ -5,6 +5,8 @@ mod config;
 mod event;
 mod state;
 mod telegram;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 use color_eyre::eyre::Result;

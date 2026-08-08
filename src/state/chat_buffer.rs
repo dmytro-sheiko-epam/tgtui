@@ -132,3 +132,72 @@ impl ChatBuffer {
         self.messages.push_back(message);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{message, page, peer};
+
+    fn ids(buffer: &ChatBuffer) -> Vec<i32> {
+        buffer.messages.iter().map(|m| m.id).collect()
+    }
+
+    #[test]
+    fn initial_page_is_stored_oldest_first() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        // The actor hands over newest-first; the buffer renders top-to-bottom.
+        buffer.set_initial(page(30, 3));
+
+        assert_eq!(ids(&buffer), [28, 29, 30]);
+        assert_eq!(buffer.oldest_id(), Some(28));
+        assert!(buffer.loaded);
+    }
+
+    #[test]
+    fn older_page_lands_ahead_of_what_we_hold_and_stays_ordered() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        buffer.set_initial(page(30, 3));
+        buffer.loading_older = true;
+
+        buffer.prepend_older(page(27, 3));
+
+        assert_eq!(ids(&buffer), [25, 26, 27, 28, 29, 30]);
+        assert_eq!(buffer.oldest_id(), Some(25));
+        assert!(!buffer.loading_older, "the in-flight guard must clear");
+        assert!(buffer.has_more_older);
+    }
+
+    #[test]
+    fn empty_older_page_marks_history_exhausted() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        buffer.set_initial(page(30, 3));
+        buffer.loading_older = true;
+
+        buffer.prepend_older(Vec::new());
+
+        assert!(!buffer.has_more_older);
+        assert!(!buffer.loading_older);
+        assert_eq!(ids(&buffer), [28, 29, 30]);
+    }
+
+    #[test]
+    fn a_chat_with_no_history_is_not_asked_for_more() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        buffer.set_initial(Vec::new());
+
+        assert!(buffer.loaded);
+        assert!(!buffer.has_more_older);
+    }
+
+    #[test]
+    fn live_message_is_appended_once_even_if_echoed() {
+        let mut buffer = ChatBuffer::new(peer(1));
+        buffer.set_initial(page(30, 1));
+
+        buffer.push_newest(message(31, "hello"));
+        // `send_message` and the update stream both report the same message.
+        buffer.push_newest(message(31, "hello"));
+
+        assert_eq!(ids(&buffer), [30, 31]);
+    }
+}

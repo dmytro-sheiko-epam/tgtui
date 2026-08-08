@@ -78,9 +78,7 @@ impl DialogListState {
 
     /// Whether scrolling has come close enough to the end to warrant fetching another page.
     pub fn wants_more(&self) -> bool {
-        !self.exhausted
-            && !self.loading
-            && self.selected + PREFETCH_MARGIN >= self.items.len()
+        !self.exhausted && !self.loading && self.selected + PREFETCH_MARGIN >= self.items.len()
     }
 
     /// Move an existing dialog to the top and refresh its preview after a new message.
@@ -98,5 +96,97 @@ impl DialogListState {
         } else if self.selected < index {
             self.selected += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::dialog;
+
+    fn list(count: i64) -> DialogListState {
+        DialogListState {
+            items: (1..=count)
+                .map(|id| dialog(id, &format!("chat {id}")))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Whichever conversation was highlighted must stay highlighted after a reorder.
+    fn assert_selection_follows(selected: usize, bumped: usize) {
+        let mut state = list(5);
+        state.selected = selected;
+        let expected = state.items[selected].name.clone();
+        let bumped_peer = state.items[bumped].peer.id;
+
+        state.bump(bumped_peer, "new".to_string());
+
+        assert_eq!(
+            state.items[state.selected].name, expected,
+            "selection drifted when row {bumped} was bumped with row {selected} selected"
+        );
+    }
+
+    #[test]
+    fn bump_moves_the_chat_to_the_top_with_a_fresh_preview() {
+        let mut state = list(3);
+        let peer = state.items[2].peer.id;
+
+        state.bump(peer, "newest line".to_string());
+
+        assert_eq!(state.items[0].name, "chat 3");
+        assert_eq!(state.items[0].preview, "newest line");
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            ["chat 3", "chat 1", "chat 2"]
+        );
+    }
+
+    #[test]
+    fn selection_follows_its_chat_through_a_bump() {
+        // The three cases that matter: the bumped row is below, above, or is the selection.
+        assert_selection_follows(1, 3);
+        assert_selection_follows(3, 1);
+        assert_selection_follows(2, 2);
+    }
+
+    #[test]
+    fn bumping_an_unknown_chat_changes_nothing() {
+        let mut state = list(2);
+        let before: Vec<_> = state.items.iter().map(|i| i.name.clone()).collect();
+
+        state.bump(dialog(99, "stranger").peer.id, "hi".to_string());
+
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .map(|i| i.name.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn more_dialogs_are_wanted_only_near_the_end_of_the_list() {
+        let mut state = list(20);
+
+        state.selected = 0;
+        assert!(!state.wants_more());
+
+        state.selected = state.items.len() - PREFETCH_MARGIN;
+        assert!(state.wants_more());
+
+        state.loading = true;
+        assert!(!state.wants_more(), "must not stack requests while loading");
+
+        state.loading = false;
+        state.exhausted = true;
+        assert!(!state.wants_more(), "must stop once the server is drained");
     }
 }

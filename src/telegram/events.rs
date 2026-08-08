@@ -12,8 +12,12 @@ pub enum TgEvent {
     /// The login code was sent; ask the user for it.
     CodeSent,
     /// The account has 2FA enabled, so the password is needed to finish signing in.
-    PasswordNeeded { hint: Option<String> },
-    SignedIn { name: String },
+    PasswordNeeded {
+        hint: Option<String>,
+    },
+    SignedIn {
+        name: String,
+    },
     /// A login step failed. The user stays on the current screen and can retry.
     LoginFailed(String),
     DialogsLoaded {

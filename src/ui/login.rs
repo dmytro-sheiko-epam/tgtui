@@ -48,9 +48,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
 
-    let [help_area, input_area, status_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Length(3), Constraint::Min(1)])
-            .areas(inner);
+    let [help_area, input_area, status_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
 
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::Gray)),
