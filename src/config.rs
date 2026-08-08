@@ -1,8 +1,8 @@
 //! Runtime configuration: API credentials and on-disk locations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use directories::ProjectDirs;
 
 /// Publicly known Telegram Desktop API credentials.
@@ -37,6 +37,9 @@ impl Config {
         let data_dir = dirs.data_dir().to_path_buf();
         // `SqliteSession::open` creates the file but not the directories leading to it.
         std::fs::create_dir_all(&data_dir)?;
+        // Covers the logs and the sidecar files SQLite writes next to the database, which
+        // would otherwise be created world-readable regardless of the database's own mode.
+        restrict_to_owner(&data_dir)?;
 
         Ok(Self {
             api_id,
@@ -44,5 +47,59 @@ impl Config {
             session_path: data_dir.join("tgtui.session"),
             log_dir: data_dir,
         })
+    }
+}
+
+/// Lock a path down to its owner: `0700` for directories, `0600` for files.
+///
+/// The session database holds the account's authorization key, and that key is a bearer
+/// credential — anyone who can read it can act as the logged-in user without ever seeing the
+/// phone number, the login code, or the 2FA password.
+pub fn restrict_to_owner(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = if path.is_dir() { 0o700 } else { 0o600 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .wrap_err_with(|| format!("could not restrict permissions on {}", path.display()))?;
+    }
+    // Windows has no mode bits; the user profile directory is already ACL-scoped to the user.
+    #[cfg(not(unix))]
+    let _ = path;
+
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_session_file_is_readable_only_by_its_owner() {
+        let dir = std::env::temp_dir().join(format!("tgtui-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tgtui.session");
+        std::fs::write(&file, b"auth key").unwrap();
+        // Start from the permissive mode a default umask would produce.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_to_owner(&file).unwrap();
+        restrict_to_owner(&dir).unwrap();
+
+        assert_eq!(
+            mode_of(&file),
+            0o600,
+            "the auth key must not be group or world readable"
+        );
+        assert_eq!(mode_of(&dir), 0o700);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

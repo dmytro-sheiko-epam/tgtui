@@ -11,5 +11,9 @@ pub async fn open(path: &Path) -> Result<Arc<SqliteSession>> {
     let session = SqliteSession::open(path)
         .await
         .wrap_err_with(|| format!("could not open session file at {}", path.display()))?;
+    // Runs on every start, not just creation, so a session written by an older build (or by a
+    // careless `chmod`) gets tightened too.
+    crate::config::restrict_to_owner(path)?;
+
     Ok(Arc::new(session))
 }
