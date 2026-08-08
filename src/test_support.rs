@@ -16,6 +16,14 @@ pub fn peer(id: i64) -> PeerRef {
     }
 }
 
+/// A broadcast channel or supergroup, whose message ids restart at 1 per channel.
+pub fn channel(id: i64) -> PeerRef {
+    PeerRef {
+        id: PeerId::channel_unchecked(id),
+        auth: PeerAuth::default(),
+    }
+}
+
 pub fn message(id: i32, text: &str) -> ChatMessage {
     ChatMessage {
         id,

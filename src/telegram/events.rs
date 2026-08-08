@@ -38,6 +38,12 @@ pub enum TgEvent {
         peer: PeerId,
         message: ChatMessage,
     },
+    /// Messages were deleted. `channel` is `Some` only for channel deletions — Telegram sends
+    /// bare ids for users and small groups.
+    MessagesDeleted {
+        channel: Option<PeerId>,
+        ids: Vec<i32>,
+    },
     /// A message arrived (or was edited) live over the update stream.
     IncomingMessage {
         peer: PeerRef,

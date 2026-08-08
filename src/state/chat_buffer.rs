@@ -124,6 +124,13 @@ impl ChatBuffer {
         }
     }
 
+    /// Drop messages that were deleted, reporting whether anything went.
+    pub fn remove(&mut self, ids: &[i32]) -> bool {
+        let before = self.messages.len();
+        self.messages.retain(|message| !ids.contains(&message.id));
+        self.messages.len() != before
+    }
+
     /// Append a message that arrived live, ignoring one we already hold.
     pub fn push_newest(&mut self, message: ChatMessage) {
         if self.messages.iter().any(|m| m.id == message.id) {

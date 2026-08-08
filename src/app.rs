@@ -5,7 +5,7 @@ use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use grammers_session::types::PeerId;
+use grammers_session::types::{PeerId, PeerKind};
 use tokio::sync::mpsc;
 
 use crate::state::chat_buffer::ChatBuffer;
@@ -192,6 +192,7 @@ impl App {
                 }
                 self.dialogs.bump(peer, message.text);
             }
+            TgEvent::MessagesDeleted { channel, ids } => self.remove_messages(channel, &ids),
             TgEvent::IncomingMessage {
                 peer,
                 message,
@@ -221,6 +222,30 @@ impl App {
                     self.login_error = Some(error);
                 } else {
                     self.set_status(error, StatusKind::Error);
+                }
+            }
+        }
+    }
+
+    /// Drop deleted messages from whichever buffer holds them.
+    ///
+    /// Telegram only names the chat for channel deletions. Everywhere else it sends bare
+    /// message ids, which is still unambiguous because users and small groups draw from one
+    /// per-account sequence — but channel ids restart at 1 per channel, so a peer-less
+    /// deletion must skip channel buffers or it would delete an unrelated message that
+    /// happens to share an id.
+    fn remove_messages(&mut self, channel: Option<PeerId>, ids: &[i32]) {
+        match channel {
+            Some(channel) => {
+                if let Some(buffer) = self.chats.get_mut(&channel) {
+                    buffer.remove(ids);
+                }
+            }
+            None => {
+                for (peer, buffer) in self.chats.iter_mut() {
+                    if peer.kind() != PeerKind::Channel {
+                        buffer.remove(ids);
+                    }
                 }
             }
         }
@@ -421,7 +446,7 @@ mod tests {
     use super::*;
     use crate::state::chat_buffer::PAGE_SIZE;
     use crate::telegram::TgEvent;
-    use crate::test_support::{app, dialog, drain, message, page, peer};
+    use crate::test_support::{app, channel, dialog, drain, message, page, peer};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -728,6 +753,88 @@ mod tests {
             buffer.messages.iter().find(|m| m.id == 100).unwrap().text,
             "edited text"
         );
+    }
+
+    #[test]
+    fn a_deleted_message_disappears_from_the_transcript() {
+        let (mut app, _rx) = opened_chat();
+        let before = app.open_buffer().unwrap().messages.len();
+
+        app.handle_event(TgEvent::MessagesDeleted {
+            channel: None,
+            ids: vec![100, 99],
+        });
+
+        let buffer = app.open_buffer().unwrap();
+        assert_eq!(buffer.messages.len(), before - 2);
+        assert!(!buffer.messages.iter().any(|m| m.id == 100 || m.id == 99));
+    }
+
+    #[test]
+    fn a_channel_deletion_only_touches_that_channel() {
+        let (mut app, _rx) = opened_chat();
+        // A channel whose ids restart at 1 and so overlap the private chat's ids.
+        app.chats
+            .insert(channel(500).id, ChatBuffer::new(channel(500)));
+        app.chats
+            .get_mut(&channel(500).id)
+            .unwrap()
+            .set_initial(page(100, 3));
+
+        app.handle_event(TgEvent::MessagesDeleted {
+            channel: Some(channel(500).id),
+            ids: vec![100],
+        });
+
+        assert!(
+            !app.chats[&channel(500).id]
+                .messages
+                .iter()
+                .any(|m| m.id == 100)
+        );
+        assert!(
+            app.chats[&peer(1).id].messages.iter().any(|m| m.id == 100),
+            "the private chat's message 100 is unrelated and must survive"
+        );
+    }
+
+    #[test]
+    fn a_peerless_deletion_leaves_channels_alone() {
+        let (mut app, _rx) = opened_chat();
+        app.chats
+            .insert(channel(500).id, ChatBuffer::new(channel(500)));
+        app.chats
+            .get_mut(&channel(500).id)
+            .unwrap()
+            .set_initial(page(100, 3));
+
+        // Telegram omits the chat for users and small groups; channel ids would collide.
+        app.handle_event(TgEvent::MessagesDeleted {
+            channel: None,
+            ids: vec![100],
+        });
+
+        assert!(
+            app.chats[&channel(500).id]
+                .messages
+                .iter()
+                .any(|m| m.id == 100),
+            "a bare id must never delete from a channel"
+        );
+        assert!(!app.chats[&peer(1).id].messages.iter().any(|m| m.id == 100));
+    }
+
+    #[test]
+    fn deleting_a_message_we_do_not_hold_is_harmless() {
+        let (mut app, _rx) = opened_chat();
+        let before = app.open_buffer().unwrap().messages.len();
+
+        app.handle_event(TgEvent::MessagesDeleted {
+            channel: None,
+            ids: vec![999_999],
+        });
+
+        assert_eq!(app.open_buffer().unwrap().messages.len(), before);
     }
 
     #[test]

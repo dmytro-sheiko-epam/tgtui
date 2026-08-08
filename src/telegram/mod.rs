@@ -14,6 +14,7 @@ use color_eyre::eyre::Result;
 use grammers_client::client::{DialogIter, LoginToken, PasswordToken, UpdatesConfiguration};
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool, SignInError};
+use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
 use tokio::sync::{Mutex, mpsc};
 
@@ -332,6 +333,15 @@ async fn stream_updates(
         let (message, edited) = match update {
             Update::NewMessage(message) => (message, false),
             Update::MessageEdited(message) => (message, true),
+            Update::MessageDeleted(deletion) => {
+                // Only channel deletions name their chat; see `App::remove_messages`.
+                let channel = deletion.channel_id().map(PeerId::channel_unchecked);
+                let _ = events.send(TgEvent::MessagesDeleted {
+                    channel,
+                    ids: deletion.into_messages(),
+                });
+                continue;
+            }
             _ => continue,
         };
 
