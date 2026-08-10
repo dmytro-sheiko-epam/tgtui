@@ -18,6 +18,39 @@ pub struct Config {
     pub api_hash: String,
     pub session_path: PathBuf,
     pub log_dir: PathBuf,
+    pub images: ImageMode,
+    /// `TGTUI_IMAGE_ROWS`: an absolute cap on how tall an inline picture may be. Unset means the
+    /// transcript decides, as a fraction of its own height.
+    pub image_rows: Option<u16>,
+}
+
+/// How hard to try to draw pictures in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageMode {
+    /// Ask the terminal what it supports, and fall back to half-blocks if it says nothing.
+    #[default]
+    Auto,
+    /// Never download or draw; media stays labelled, as it was before images existed.
+    Off,
+    /// Skip the capability query and use coloured half-blocks. For terminals where detection
+    /// misfires, or over a link where the query round-trip is unreliable.
+    Halfblocks,
+}
+
+impl ImageMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("TGTUI_IMAGES") {
+            Err(_) => Ok(Self::Auto),
+            Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "" | "auto" => Ok(Self::Auto),
+                "off" | "none" => Ok(Self::Off),
+                "halfblocks" => Ok(Self::Halfblocks),
+                _ => Err(eyre!(
+                    "TGTUI_IMAGES must be auto, off or halfblocks, got {raw:?}"
+                )),
+            },
+        }
+    }
 }
 
 impl Config {
@@ -46,7 +79,22 @@ impl Config {
             api_hash,
             session_path: data_dir.join("tgtui.session"),
             log_dir: data_dir,
+            images: ImageMode::from_env()?,
+            image_rows: image_rows_from_env()?,
         })
+    }
+}
+
+fn image_rows_from_env() -> Result<Option<u16>> {
+    match std::env::var("TGTUI_IMAGE_ROWS") {
+        Err(_) => Ok(None),
+        Ok(raw) => match raw.trim().parse::<u16>() {
+            // Zero would leave no room to draw in, which reads as "off" but silently isn't.
+            Ok(rows) if rows > 0 => Ok(Some(rows)),
+            _ => Err(eyre!(
+                "TGTUI_IMAGE_ROWS must be a positive number of rows, got {raw:?}"
+            )),
+        },
     }
 }
 

@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 use crate::config::Config;
+use crate::ui::images::ImageStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,11 +25,15 @@ async fn main() -> Result<()> {
 
     let telegram = telegram::spawn(&config).await?;
     let mut app = App::new(telegram.commands);
+    app.image_rows = config.image_rows;
 
     // `ratatui::init` enables raw mode, switches to the alternate screen, and chains a panic
     // hook that restores both before color-eyre prints its report.
     let mut terminal = ratatui::init();
-    let result = event::run(&mut terminal, &mut app, telegram.events).await;
+    // Must come after raw mode: querying the terminal's graphics support means writing control
+    // sequences to stdout and reading the reply from stdin, which cooked mode would swallow.
+    let mut images = ImageStore::new(config.images);
+    let result = event::run(&mut terminal, &mut app, telegram.events, &mut images).await;
     ratatui::restore();
 
     result

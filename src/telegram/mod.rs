@@ -10,12 +10,13 @@ pub mod session;
 
 use std::sync::Arc;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 use grammers_client::client::{DialogIter, LoginToken, PasswordToken, UpdatesConfiguration};
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
+use image::DynamicImage;
 use tokio::sync::{Mutex, mpsc};
 
 pub use commands::TgCommand;
@@ -24,6 +25,7 @@ pub use events::TgEvent;
 use crate::config::Config;
 use crate::state::chat_buffer::{self, ChatMessage};
 use crate::state::dialog_list::{self, DialogSummary};
+use crate::state::media::{self, PhotoSource};
 
 /// Channel endpoints the UI uses to drive the actor.
 pub struct Telegram {
@@ -99,6 +101,11 @@ async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCo
             TgCommand::LoadOlderMessages { peer, before_id } => {
                 actor.load_older_messages(peer, before_id)
             }
+            TgCommand::DownloadPhoto {
+                peer,
+                message_id,
+                source,
+            } => actor.download_photo(peer, message_id, source),
             TgCommand::SendMessage { peer, text } => actor.send_message(peer, text),
 
             TgCommand::Shutdown => {
@@ -265,6 +272,35 @@ impl Actor {
         });
     }
 
+    fn download_photo(
+        &mut self,
+        peer: grammers_session::types::PeerRef,
+        message_id: i32,
+        source: Box<PhotoSource>,
+    ) {
+        let client = self.client.clone();
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            let image = match fetch_image(&client, &source).await {
+                Ok(image) => Some(Arc::new(image)),
+                Err(err) => {
+                    // Unlike other failures this gets no status banner. A chat can hold dozens
+                    // of photos, and the transcript already says what happened by falling back
+                    // to the label.
+                    tracing::debug!(%err, message_id, "photo download failed");
+                    None
+                }
+            };
+
+            let _ = events.send(TgEvent::PhotoLoaded {
+                peer: peer.id,
+                message_id,
+                image,
+            });
+        });
+    }
+
     fn send_message(&mut self, peer: grammers_session::types::PeerRef, text: String) {
         let client = self.client.clone();
         let events = self.events.clone();
@@ -302,6 +338,33 @@ async fn collect_page(
         messages.push(ChatMessage::from_grammers(&message));
     }
     Ok(messages)
+}
+
+/// Download a picture into memory and decode it.
+///
+/// Nothing is written to disk: the data directory is locked down for the session key, and chat
+/// photos have no business outliving the process that showed them.
+async fn fetch_image(client: &Client, source: &PhotoSource) -> Result<DynamicImage> {
+    let mut download = match source {
+        // Both are `Downloadable`, but they are distinct types, so the iterator is built here
+        // rather than behind a trait object.
+        PhotoSource::Thumb(thumb) => client.iter_download(thumb),
+        PhotoSource::File(document) => client.iter_download(document),
+    };
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = download.next().await? {
+        bytes.extend(chunk);
+        // A document whose declared mime type lies would otherwise be pulled in whole.
+        if bytes.len() > media::MAX_PHOTO_BYTES {
+            return Err(eyre!("larger than {} bytes", media::MAX_PHOTO_BYTES));
+        }
+    }
+
+    // Decoding is CPU-bound and must not sit on a runtime worker while other requests wait.
+    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes))
+        .await?
+        .map_err(Into::into)
 }
 
 /// Forward live updates for as long as the connection lasts.

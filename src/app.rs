@@ -1,7 +1,7 @@
 //! Application state and the reducers driving it.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::state::chat_buffer::ChatBuffer;
 use crate::state::dialog_list::DialogListState;
+use crate::state::media::{PhotoRef, PhotoSource, PhotoState};
 use crate::telegram::{TgCommand, TgEvent};
 
 /// How long a status banner stays on screen before it fades away.
@@ -17,6 +18,15 @@ const STATUS_TTL: Duration = Duration::from_secs(6);
 
 /// Load more history once the view is within this many lines of the top of the buffer.
 const SCROLL_PREFETCH_LINES: usize = 10;
+
+/// Photo downloads allowed in flight at once. Opening a photo-heavy chat would otherwise fire a
+/// whole viewport of requests in a single frame.
+const MAX_PHOTO_DOWNLOADS: usize = 4;
+
+/// Decoded pictures held in memory at once. Each costs a few hundred kilobytes, so scrolling an
+/// image-heavy chat would otherwise grow the process without bound. Comfortably more than one
+/// viewport holds, so an image on screen is never evicted only to be fetched again.
+const MAX_DECODED_PHOTOS: usize = 48;
 
 #[derive(Debug)]
 pub enum Screen {
@@ -77,7 +87,18 @@ pub struct App {
     pub compose: String,
     pub focus: Focus,
     pub metrics: ChatViewMetrics,
+    /// The picture being examined full screen. Modal: while it is set, keys go to the viewer and
+    /// the transcript is not drawn at all.
+    pub viewer: Option<i32>,
+    /// `TGTUI_IMAGE_ROWS`, if set: an absolute cap on how tall an inline picture may be.
+    pub image_rows: Option<u16>,
+    /// Photo messages the last frame actually drew, in transcript order so the newest is last.
+    visible_photos: Vec<i32>,
     pub should_quit: bool,
+    /// Photo downloads issued but not yet answered, capped by `MAX_PHOTO_DOWNLOADS`.
+    downloading: usize,
+    /// Decoded pictures in the order they arrived, so the oldest can be dropped first.
+    decoded: VecDeque<(PeerId, i32)>,
     commands: mpsc::UnboundedSender<TgCommand>,
 }
 
@@ -95,7 +116,12 @@ impl App {
             compose: String::new(),
             focus: Focus::Chats,
             metrics: ChatViewMetrics::default(),
+            viewer: None,
+            image_rows: None,
+            visible_photos: Vec::new(),
             should_quit: false,
+            downloading: 0,
+            decoded: VecDeque::new(),
             commands,
         };
         app.send(TgCommand::CheckAuthorized);
@@ -186,6 +212,26 @@ impl App {
                     buffer.prepend_older(messages);
                 }
             }
+            TgEvent::PhotoLoaded {
+                peer,
+                message_id,
+                image,
+            } => {
+                self.downloading = self.downloading.saturating_sub(1);
+                let stored = self
+                    .photo_mut(peer, message_id)
+                    .map(|photo| {
+                        photo.state = match image {
+                            Some(image) => PhotoState::Ready(image),
+                            None => PhotoState::Failed,
+                        };
+                        matches!(photo.state, PhotoState::Ready(_))
+                    })
+                    .unwrap_or(false);
+                if stored {
+                    self.remember_decoded(peer, message_id);
+                }
+            }
             TgEvent::MessageSent { peer, message } => {
                 if let Some(buffer) = self.chats.get_mut(&peer) {
                     buffer.push_newest(message.clone());
@@ -203,7 +249,17 @@ impl App {
                         if let Some(existing) =
                             buffer.messages.iter_mut().find(|m| m.id == message.id)
                         {
-                            *existing = message.clone();
+                            let mut replacement = message.clone();
+                            // An edit usually only touches the caption. Carrying a picture we
+                            // already hold across the replacement keeps it from flickering back
+                            // to a label and downloading itself again.
+                            if let (Some(old), Some(new)) =
+                                (&existing.photo, &mut replacement.photo)
+                                && old.source == new.source
+                            {
+                                new.state = old.state.clone();
+                            }
+                            *existing = replacement;
                         }
                     } else {
                         buffer.push_newest(message.clone());
@@ -248,6 +304,14 @@ impl App {
                     }
                 }
             }
+        }
+
+        // Whoever was being examined may have just been deleted out from under the viewer.
+        if self
+            .viewer
+            .is_some_and(|id| !self.photo_ids().contains(&id))
+        {
+            self.viewer = None;
         }
     }
 
@@ -306,6 +370,19 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) {
+        // Ctrl+P rather than a letter: with the message pane focused every plain character goes
+        // into the compose box.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('p') {
+            return self.toggle_viewer();
+        }
+
+        // The viewer is modal — nothing behind it is reachable, and nothing it swallows can
+        // leak into the compose box.
+        if self.viewer.is_some() {
+            return self.handle_viewer_key(key);
+        }
+
         match key.code {
             KeyCode::Tab => {
                 self.focus = match self.focus {
@@ -402,6 +479,143 @@ impl App {
         self.send(TgCommand::LoadOlderMessages { peer, before_id });
     }
 
+    /// Ask for the pictures of the photo messages currently on screen.
+    ///
+    /// The render pass supplies the ids because only it knows where the wrapped transcript
+    /// actually landed — the same reason it writes `metrics` back.
+    pub fn request_visible_photos(&mut self, visible: &[i32]) {
+        // Also what `Ctrl+P` opens: the render pass is the only thing that knows which pictures
+        // actually made it onto the screen. The viewer calls this too, for the one picture it is
+        // showing, and must not overwrite what the transcript found.
+        if self.viewer.is_none() && self.visible_photos != visible {
+            self.visible_photos = visible.to_vec();
+        }
+
+        let Some(peer_id) = self.open_chat else {
+            return;
+        };
+        let Some(buffer) = self.chats.get(&peer_id) else {
+            return;
+        };
+        let peer = buffer.peer;
+
+        let budget = MAX_PHOTO_DOWNLOADS.saturating_sub(self.downloading);
+        let wanted: Vec<(i32, PhotoSource)> = buffer
+            .messages
+            .iter()
+            .filter(|message| visible.contains(&message.id))
+            .filter_map(|message| {
+                let photo = message.photo.as_ref()?;
+                // Only `Pending` is ever requested. `Loading` is already in flight, and
+                // `Failed` is terminal — the trigger here is visibility, so a retry would fire
+                // again on the very next frame.
+                matches!(photo.state, PhotoState::Pending)
+                    .then(|| (message.id, photo.source.clone()))
+            })
+            .take(budget)
+            .collect();
+
+        for (message_id, source) in wanted {
+            if let Some(photo) = self.photo_mut(peer_id, message_id) {
+                photo.state = PhotoState::Loading;
+            }
+            self.downloading += 1;
+            self.send(TgCommand::DownloadPhoto {
+                peer,
+                message_id,
+                source: Box::new(source),
+            });
+        }
+    }
+
+    // -- the full-screen viewer ----------------------------------------------
+
+    fn handle_viewer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.viewer = None,
+            KeyCode::Left | KeyCode::Char('h') => self.step_viewer(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.step_viewer(1),
+            _ => {}
+        }
+    }
+
+    fn toggle_viewer(&mut self) {
+        if self.viewer.is_some() {
+            self.viewer = None;
+            return;
+        }
+        // The newest picture on screen. `visible_photos` holds only what the last frame could
+        // actually draw, so this never opens onto an empty frame.
+        match self.visible_photos.last() {
+            Some(&id) => self.viewer = Some(id),
+            None => self.set_status("no picture in view", StatusKind::Info),
+        }
+    }
+
+    /// Move to the neighbouring picture in the chat, stopping at either end.
+    ///
+    /// Wrapping from the newest picture to one a thousand messages back would lose your place,
+    /// so the ends are walls.
+    fn step_viewer(&mut self, delta: isize) {
+        let Some(current) = self.viewer else {
+            return;
+        };
+        let photos = self.photo_ids();
+        let Some(at) = photos.iter().position(|&id| id == current) else {
+            return;
+        };
+
+        let next = (at as isize + delta).clamp(0, photos.len() as isize - 1) as usize;
+        self.viewer = Some(photos[next]);
+    }
+
+    /// Every picture in the open chat, oldest first — including ones never scrolled into view,
+    /// which the viewer downloads on arrival.
+    pub fn photo_ids(&self) -> Vec<i32> {
+        self.open_buffer()
+            .map(|buffer| {
+                buffer
+                    .messages
+                    .iter()
+                    .filter(|message| message.photo.is_some())
+                    .map(|message| message.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Where the open picture sits among the chat's pictures, as a 1-based `(nth, total)`.
+    pub fn viewer_position(&self) -> Option<(usize, usize)> {
+        let current = self.viewer?;
+        let photos = self.photo_ids();
+        let at = photos.iter().position(|&id| id == current)?;
+        Some((at + 1, photos.len()))
+    }
+
+    /// Track a newly decoded picture, dropping the oldest once too many are held.
+    fn remember_decoded(&mut self, peer: PeerId, message_id: i32) {
+        self.decoded.push_back((peer, message_id));
+        while self.decoded.len() > MAX_DECODED_PHOTOS
+            && let Some((peer, message_id)) = self.decoded.pop_front()
+        {
+            // Back to `Pending` rather than `Failed`: scrolling it into view again should
+            // fetch it once more.
+            if let Some(photo) = self.photo_mut(peer, message_id) {
+                photo.state = PhotoState::Pending;
+            }
+        }
+    }
+
+    fn photo_mut(&mut self, peer: PeerId, message_id: i32) -> Option<&mut PhotoRef> {
+        self.chats
+            .get_mut(&peer)?
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)?
+            .photo
+            .as_mut()
+    }
+
     fn load_more_dialogs_if_needed(&mut self) {
         if self.dialogs.wants_more() {
             self.dialogs.loading = true;
@@ -446,7 +660,9 @@ mod tests {
     use super::*;
     use crate::state::chat_buffer::PAGE_SIZE;
     use crate::telegram::TgEvent;
-    use crate::test_support::{app, channel, dialog, drain, message, page, peer};
+    use crate::test_support::{
+        app, channel, dialog, drain, gradient, message, page, peer, photo_message,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -868,5 +1084,374 @@ mod tests {
         }
 
         assert_eq!(app.open_buffer().unwrap().scroll, 0);
+    }
+
+    // -- pictures ------------------------------------------------------------
+
+    /// An open chat holding `count` photo messages with ids 1..=count.
+    fn chat_of_photos(count: i32) -> (App, mpsc::UnboundedReceiver<TgCommand>) {
+        let (mut app, mut rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![dialog(1, "Alice")],
+            exhausted: true,
+        });
+        app.handle_event(TgEvent::MessagesLoaded {
+            peer: peer(1).id,
+            messages: (1..=count)
+                .rev()
+                .map(|id| photo_message(id, "", 100, 200))
+                .collect(),
+        });
+        drain(&mut rx);
+        (app, rx)
+    }
+
+    fn photo_state(app: &App, id: i32) -> PhotoState {
+        app.open_buffer()
+            .unwrap()
+            .messages
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .photo
+            .clone()
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn a_visible_photo_is_requested_exactly_once() {
+        let (mut app, mut rx) = chat_of_photos(1);
+
+        app.request_visible_photos(&[1]);
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [TgCommand::DownloadPhoto { message_id: 1, .. }]
+            ),
+            "expected one download, got {commands:?}"
+        );
+
+        // Every frame calls this again while the message stays on screen.
+        app.request_visible_photos(&[1]);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the in-flight guard must hold across redraws"
+        );
+    }
+
+    #[test]
+    fn a_photo_off_screen_costs_no_bandwidth() {
+        let (mut app, mut rx) = chat_of_photos(3);
+
+        app.request_visible_photos(&[2]);
+
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [TgCommand::DownloadPhoto { message_id: 2, .. }]
+            ),
+            "only the message on screen is worth fetching, got {commands:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_photo_is_never_requested_again() {
+        let (mut app, mut rx) = chat_of_photos(1);
+        app.request_visible_photos(&[1]);
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::PhotoLoaded {
+            peer: peer(1).id,
+            message_id: 1,
+            image: None,
+        });
+        app.request_visible_photos(&[1]);
+
+        assert!(matches!(photo_state(&app, 1), PhotoState::Failed));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "visibility is the trigger, so a retry would fire again on the very next frame"
+        );
+    }
+
+    #[test]
+    fn only_a_few_photos_download_at_a_time() {
+        let (mut app, mut rx) = chat_of_photos(20);
+        let visible: Vec<i32> = (1..=20).collect();
+
+        app.request_visible_photos(&visible);
+
+        assert_eq!(
+            drain(&mut rx).len(),
+            MAX_PHOTO_DOWNLOADS,
+            "opening a photo-heavy chat must not fire a whole viewport of requests at once"
+        );
+    }
+
+    #[test]
+    fn a_finished_download_frees_a_slot_for_the_next_photo() {
+        let (mut app, mut rx) = chat_of_photos(20);
+        let visible: Vec<i32> = (1..=20).collect();
+        app.request_visible_photos(&visible);
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::PhotoLoaded {
+            peer: peer(1).id,
+            message_id: 1,
+            image: Some(gradient(8, 8)),
+        });
+        app.request_visible_photos(&visible);
+
+        assert!(matches!(photo_state(&app, 1), PhotoState::Ready(_)));
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "one download came back, so exactly one more may start"
+        );
+    }
+
+    #[test]
+    fn the_oldest_pictures_are_dropped_once_too_many_are_held() {
+        let count = MAX_DECODED_PHOTOS as i32 + 1;
+        let (mut app, _rx) = chat_of_photos(count);
+
+        for id in 1..=count {
+            app.handle_event(TgEvent::PhotoLoaded {
+                peer: peer(1).id,
+                message_id: id,
+                image: Some(gradient(8, 8)),
+            });
+        }
+
+        assert!(
+            matches!(photo_state(&app, 1), PhotoState::Pending),
+            "scrolling an image-heavy chat would otherwise grow the process without bound"
+        );
+        assert!(
+            matches!(photo_state(&app, count), PhotoState::Ready(_)),
+            "and the newest must survive"
+        );
+    }
+
+    // -- the full-screen viewer ----------------------------------------------
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// A chat of `count` pictures, all downloaded, with the render pass having reported them all
+    /// on screen.
+    fn viewable_chat(count: i32) -> (App, mpsc::UnboundedReceiver<TgCommand>) {
+        let (mut app, mut rx) = chat_of_photos(count);
+        for id in 1..=count {
+            app.handle_event(TgEvent::PhotoLoaded {
+                peer: peer(1).id,
+                message_id: id,
+                image: Some(gradient(8, 8)),
+            });
+        }
+        let visible: Vec<i32> = (1..=count).collect();
+        app.request_visible_photos(&visible);
+        drain(&mut rx);
+        (app, rx)
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_newest_picture_on_screen() {
+        let (mut app, _rx) = viewable_chat(3);
+        app.focus = Focus::Messages;
+
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        assert_eq!(
+            app.viewer,
+            Some(3),
+            "the newest in view is the one you meant"
+        );
+    }
+
+    #[test]
+    fn plain_p_still_types_into_the_compose_box() {
+        let (mut app, _rx) = viewable_chat(1);
+        app.focus = Focus::Messages;
+
+        app.handle_key(key(KeyCode::Char('p')));
+
+        assert_eq!(app.compose, "p");
+        assert!(
+            app.viewer.is_none(),
+            "the viewer key must not steal an ordinary letter"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_with_nothing_drawable_says_so_instead_of_opening_an_empty_frame() {
+        // A chat of photos that were never rendered, so nothing is known to be on screen.
+        let (mut app, _rx) = chat_of_photos(2);
+
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        assert!(app.viewer.is_none());
+        assert_eq!(app.status.as_ref().unwrap().text, "no picture in view");
+    }
+
+    #[test]
+    fn arrows_step_between_the_chats_pictures() {
+        let (mut app, _rx) = viewable_chat(3);
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.viewer, Some(2));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.viewer, Some(3));
+    }
+
+    #[test]
+    fn stepping_past_either_end_stays_put() {
+        let (mut app, _rx) = viewable_chat(2);
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(app.viewer, Some(1), "the oldest picture is a wall");
+
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(
+            app.viewer,
+            Some(2),
+            "wrapping to the far end of a long chat would lose your place"
+        );
+    }
+
+    #[test]
+    fn the_viewer_reaches_pictures_that_were_never_on_screen() {
+        let (mut app, mut rx) = chat_of_photos(3);
+        // Only the newest was ever rendered and downloaded.
+        app.request_visible_photos(&[3]);
+        app.handle_event(TgEvent::PhotoLoaded {
+            peer: peer(1).id,
+            message_id: 3,
+            image: Some(gradient(8, 8)),
+        });
+        drain(&mut rx);
+
+        app.handle_key(ctrl(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Left));
+        // Standing in for the viewer's own render, which asks for whatever it is showing.
+        app.request_visible_photos(&[2]);
+
+        assert_eq!(app.viewer, Some(2));
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [TgCommand::DownloadPhoto { message_id: 2, .. }]
+            ),
+            "stepping onto an undownloaded picture must fetch it, got {commands:?}"
+        );
+    }
+
+    #[test]
+    fn the_viewer_does_not_forget_what_the_transcript_had_on_screen() {
+        let (mut app, _rx) = viewable_chat(3);
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        // The viewer's render, reporting only the picture it shows.
+        app.handle_key(key(KeyCode::Left));
+        app.request_visible_photos(&[2]);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        assert_eq!(
+            app.viewer,
+            Some(3),
+            "reopening must go back to what the transcript shows, not the last one examined"
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_viewer_and_leaves_the_chat_open() {
+        let (mut app, _rx) = viewable_chat(2);
+        app.focus = Focus::Messages;
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.viewer.is_none());
+        assert_eq!(app.open_chat, Some(peer(1).id));
+        assert_eq!(
+            app.focus,
+            Focus::Messages,
+            "Esc closed the viewer, so it must not also have gone back to the chat list"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_closes_the_viewer_it_opened() {
+        let (mut app, _rx) = viewable_chat(1);
+
+        app.handle_key(ctrl(KeyCode::Char('p')));
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn typing_cannot_leak_through_the_viewer() {
+        let (mut app, _rx) = viewable_chat(1);
+        app.focus = Focus::Messages;
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            app.compose.is_empty(),
+            "the viewer is modal; keys behind it must not reach the compose box"
+        );
+    }
+
+    #[test]
+    fn deleting_the_picture_being_examined_closes_the_viewer() {
+        let (mut app, _rx) = viewable_chat(2);
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        app.handle_event(TgEvent::MessagesDeleted {
+            channel: None,
+            ids: vec![2],
+        });
+
+        assert!(
+            app.viewer.is_none(),
+            "the viewer must not be left pointing at a message that is gone"
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_the_picture_it_already_downloaded() {
+        let (mut app, _rx) = chat_of_photos(1);
+        app.handle_event(TgEvent::PhotoLoaded {
+            peer: peer(1).id,
+            message_id: 1,
+            image: Some(gradient(8, 8)),
+        });
+
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(1),
+            message: photo_message(1, "fixed the typo", 100, 200),
+            edited: true,
+        });
+
+        assert!(
+            matches!(photo_state(&app, 1), PhotoState::Ready(_)),
+            "an edited caption must not make the picture flicker back to a label"
+        );
     }
 }

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-cargo test                                  # whole suite (46 tests, all unit tests inside src/)
+cargo test                                  # whole suite (101 tests, all unit tests inside src/)
 cargo test scrolling_near_the_top           # one test by substring of its name
 cargo test app::tests                       # one module's tests
 cargo clippy --all-targets
@@ -20,6 +20,10 @@ channel, so the whole state machine is drivable by feeding `TgEvent`s and draini
 Debugging a real run: the TUI owns stdout, so `println!` is useless. Use `tracing` and read the
 log — `TGTUI_LOG=debug cargo run` writes to `~/Library/Application Support/tgtui/tgtui.log`
 (macOS; the platform data dir elsewhere). Delete `tgtui.session` in that directory to sign out.
+The log also records which graphics protocol the terminal reported at startup. `TGTUI_IMAGES`
+overrides that detection: `off` keeps media labelled, `halfblocks` skips the query.
+`TGTUI_IMAGE_ROWS=<n>` caps how tall an inline picture may be; unset, the transcript gives one
+two thirds of its own height.
 
 ## Architecture
 
@@ -44,6 +48,9 @@ Telegram events ├─> event::run (select! loop) ─> App (sync reducers) ─> 
   loop (they're strictly sequential); everything else is `tokio::spawn`ed so a slow request or a
   flood-wait sleep can't stall commands queued behind it.
 - **`ui::draw`** (`src/ui/`) is a pure function of `App` — every frame is rebuilt from scratch.
+  It also carries an `ImageStore` (`src/ui/images.rs`), the one piece of state that belongs to
+  the terminal rather than the app: the graphics protocol, the font's pixel size, and a bounded
+  cache of encoded pictures. `App` holds decoded images and nothing terminal-specific.
 
 When adding a feature that talks to Telegram, the shape is always: new `TgCommand` variant →
 actor arm → new `TgEvent` variant → `App::handle_event` arm → render. Don't reach for the client
@@ -74,13 +81,39 @@ from `App`.
   because update gap resolution needs the peers that fetch puts in the session cache.
 - **Session file permissions.** `config::restrict_to_owner` runs on every start (0700 dirs, 0600
   files) — the session DB holds a bearer auth key. Don't add files to the data dir without it.
+- **A picture must claim exactly the rows it covers.** `scroll` and `metrics.total_lines` are
+  denominated in transcript lines, so `chat_view::build_transcript` pushes exactly
+  `size.height` blank lines per drawn image and records a `Placement` over them. Reserve a row
+  too many and the viewport drifts by one per image. `ImageStore::reserve` (before the download)
+  and `ImageStore::prepare` (after) deliberately share `fit`, so the count never changes when
+  the picture arrives.
+- **Photos are fetched by visibility.** `render_transcript` hands `App::request_visible_photos`
+  the ids on screen. `PhotoState` is the in-flight guard — only `Pending` is requested, and
+  `Failed` is terminal, because the trigger fires again on the very next frame. That same call
+  records what `Ctrl+P` opens, which is why the viewer must not clobber it with its own id.
+- **Encodings are cached per `(message id, size)`.** The same picture is held inline *and* full
+  screen. One entry per message would re-encode on every trip in and out of the viewer.
+- **The viewer is modal.** While `App.viewer` is set, `handle_main_key` routes everything to
+  `handle_viewer_key` and `ui::draw` skips both panes. Without that, keys would fall through to
+  the compose box behind it.
 
 ## Scope
 
-Plain-text reading and sending only. Media is labelled (`[photo]`, `[file]`, …) in
-`chat_buffer::media_label`, never downloaded. `grammers_client::media::Media` is
-`#[non_exhaustive]`, so keep the catch-all arm. Editing, deleting, reactions, and multiple
+Reading and sending plain text, and **displaying** pictures inline: photos, image documents,
+still (WebP) stickers, and the cover thumbnail of videos and GIFs. Everything else is still
+labelled (`[file]`, `[poll]`, …) by `state::media::media_label` and never downloaded — and so is
+a picture whose terminal can't draw it. `grammers_client::media::Media` is `#[non_exhaustive]`,
+so keep the catch-all arm. Sending media, editing, deleting, reactions, animation, and multiple
 accounts are deliberately out of scope.
+
+Keys: `Ctrl+P` opens the newest picture on screen full screen — a modifier because every plain
+character goes into the compose box — then `←`/`→` step through the chat's pictures and `Esc`
+closes. Stepping clamps at either end rather than wrapping.
+
+Pictures live in memory only and are never written to disk — the data directory is locked down
+for the session key, and chat photos have no business outliving the process. `state::media`
+picks a thumbnail sized for a terminal rather than the original, and `ui::images` caps how many
+decoded and encoded copies are held at once.
 
 Dependencies pinned with `=` (`crossterm`, `grammers-client`, `grammers-session`) are pinned
 because grammers is pre-1.0 and its API moves between patch releases; bumping them means

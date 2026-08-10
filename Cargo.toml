@@ -11,7 +11,9 @@ directories = "6.0.0"
 futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
 grammers-client = "=0.10.0"
 grammers-session = "=0.10.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 ratatui = "0.30.2"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use crate::app::App;
 use crate::telegram::TgEvent;
 use crate::ui;
+use crate::ui::images::ImageStore;
 
 /// Forces a redraw often enough for spinners and the status banner to feel live.
 const TICK: Duration = Duration::from_millis(250);
@@ -19,12 +20,13 @@ pub async fn run(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     mut events: mpsc::UnboundedReceiver<TgEvent>,
+    images: &mut ImageStore,
 ) -> Result<()> {
     let mut input = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
 
     loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        terminal.draw(|frame| ui::draw(frame, app, images))?;
         if app.should_quit {
             return Ok(());
         }

@@ -2,6 +2,8 @@
 
 use grammers_session::types::PeerRef;
 
+use crate::state::media::PhotoSource;
+
 #[derive(Debug)]
 pub enum TgCommand {
     /// Ask whether the persisted session is still logged in.
@@ -25,6 +27,15 @@ pub enum TgCommand {
     LoadOlderMessages {
         peer: PeerRef,
         before_id: i32,
+    },
+    /// Fetch and decode the picture for one message. Issued only for messages already on screen.
+    ///
+    /// The source is boxed because it carries a full file location: inline, it would make every
+    /// command in this channel as large as the largest one.
+    DownloadPhoto {
+        peer: PeerRef,
+        message_id: i32,
+        source: Box<PhotoSource>,
     },
     SendMessage {
         peer: PeerRef,

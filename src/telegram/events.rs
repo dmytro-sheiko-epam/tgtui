@@ -1,6 +1,9 @@
 //! Responses and pushes sent from the Telegram actor back to the UI loop.
 
+use std::sync::Arc;
+
 use grammers_session::types::{PeerId, PeerRef};
+use image::DynamicImage;
 
 use crate::state::chat_buffer::ChatMessage;
 use crate::state::dialog_list::DialogSummary;
@@ -33,6 +36,14 @@ pub enum TgEvent {
     OlderMessagesLoaded {
         peer: PeerId,
         messages: Vec<ChatMessage>,
+    },
+    /// A photo finished downloading. `image` is `None` when it failed — the failure is still
+    /// reported in the success shape, so the in-flight guard clears the way
+    /// `OlderMessagesLoaded` does, and the transcript falls back to the label.
+    PhotoLoaded {
+        peer: PeerId,
+        message_id: i32,
+        image: Option<Arc<DynamicImage>>,
     },
     MessageSent {
         peer: PeerId,

@@ -3,9 +3,10 @@
 use std::collections::VecDeque;
 
 use chrono::{DateTime, Local, Utc};
-use grammers_client::media::Media;
 use grammers_client::message::Message;
 use grammers_session::types::PeerRef;
+
+use crate::state::media::{PhotoRef, media_label, photo_ref};
 
 /// How many messages to request per page, both for the initial load and each scroll-up.
 pub const PAGE_SIZE: usize = 50;
@@ -18,16 +19,24 @@ pub struct ChatMessage {
     pub sender: Option<String>,
     pub text: String,
     pub date: DateTime<Utc>,
+    /// `Some` when this message can be shown as a picture rather than a label.
+    pub photo: Option<PhotoRef>,
 }
 
 impl ChatMessage {
     pub fn from_grammers(msg: &Message) -> Self {
-        // Media is out of scope for this client, so it is labelled rather than downloaded.
-        // A media message may also carry a caption, which is worth showing alongside the label.
-        let text = match (msg.media(), msg.text()) {
+        let media = msg.media();
+        let photo = media.as_ref().and_then(photo_ref);
+
+        // Media that can't be drawn is labelled inline instead, alongside any caption. When it
+        // *can* be drawn the label lives on the `PhotoRef` and only the caption is text, so the
+        // transcript prints the label while the download is in flight and drops it once the
+        // picture replaces it.
+        let text = match (&media, msg.text()) {
             (None, text) => text.to_string(),
-            (Some(media), "") => media_label(&media).to_string(),
-            (Some(media), caption) => format!("{} {caption}", media_label(&media)),
+            (Some(_), caption) if photo.is_some() => caption.to_string(),
+            (Some(media), "") => media_label(media).to_string(),
+            (Some(media), caption) => format!("{} {caption}", media_label(media)),
         };
 
         Self {
@@ -39,27 +48,12 @@ impl ChatMessage {
                 .map(str::to_string),
             text,
             date: msg.date(),
+            photo,
         }
     }
 
     pub fn local_time(&self) -> DateTime<Local> {
         self.date.with_timezone(&Local)
-    }
-}
-
-fn media_label(media: &Media) -> &'static str {
-    match media {
-        Media::Photo(_) => "[photo]",
-        Media::Document(_) => "[file]",
-        Media::Sticker(_) => "[sticker]",
-        Media::Contact(_) => "[contact]",
-        Media::Poll(_) => "[poll]",
-        Media::Geo(_) | Media::GeoLive(_) => "[location]",
-        Media::Dice(_) => "[dice]",
-        Media::Venue(_) => "[venue]",
-        Media::WebPage(_) => "[link]",
-        // `Media` is non-exhaustive; new kinds get a neutral label rather than breaking the build.
-        _ => "[media]",
     }
 }
 
