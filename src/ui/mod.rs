@@ -78,7 +78,7 @@ mod tests {
     use crate::app::App;
     use crate::state::chat_buffer::PAGE_SIZE;
     use crate::telegram::TgEvent;
-    use crate::test_support::{app, dialog, loaded_photo_message, page, peer};
+    use crate::test_support::{app, dialog, loaded_photo_message, message, page, peer};
 
     /// Render an app to a fixed-size test terminal and return the screen as text.
     fn screen(app: &mut App) -> String {
@@ -282,5 +282,27 @@ mod tests {
                 .draw(|frame| draw(frame, &mut app, &mut images))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn an_unread_chat_wears_its_count_in_the_list() {
+        let mut app = loaded_app();
+        // Chat 1 is the open one, so chat 2 is the one that can carry a badge.
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: message(1, "you around?"),
+            edited: false,
+        });
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: message(2, "still there?"),
+            edited: false,
+        });
+
+        let screen = screen(&mut app);
+        assert!(
+            screen.contains("Bob") && screen.contains(" 2 "),
+            "the badge must show how many are waiting:\n{screen}"
+        );
     }
 }

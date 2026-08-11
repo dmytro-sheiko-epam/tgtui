@@ -61,6 +61,26 @@ pub enum TgEvent {
         message: ChatMessage,
         edited: bool,
     },
+    /// The other side read our messages up to and including `max_id`, so their ticks rise from
+    /// ✓ to ✓✓.
+    ///
+    /// Telegram has no per-message read flag — there is only this one watermark per chat, and
+    /// resolving an update gap can replay an older one after a newer one, so it is applied as a
+    /// maximum rather than an assignment.
+    OutgoingRead {
+        peer: PeerId,
+        max_id: i32,
+    },
+    /// *We* read incoming messages in this chat somewhere — almost always another device, because
+    /// tgtui never acknowledges a read itself.
+    ///
+    /// Only the server's `still_unread_count` is carried: the update's `max_id` can't be turned
+    /// into a count here (service messages and our own messages don't count as unread), and the
+    /// count is the only thing the badge needs.
+    IncomingRead {
+        peer: PeerId,
+        still_unread: i32,
+    },
     /// A non-fatal problem worth surfacing in the status banner.
     Error(String),
 }

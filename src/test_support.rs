@@ -194,7 +194,81 @@ pub fn dialog(id: i64, name: &str) -> DialogSummary {
         peer: peer(id),
         name: name.to_string(),
         preview: format!("last from {name}"),
+        read_outbox_max_id: Some(0),
+        unread: 0,
     }
+}
+
+/// The same, for a channel — whose bare id shares a number space with a user's.
+pub fn channel_dialog(id: i64, name: &str) -> DialogSummary {
+    DialogSummary {
+        peer: channel(id),
+        ..dialog(id, name)
+    }
+}
+
+/// A message of our own, as the echo of a send or an update from another device delivers it.
+pub fn outgoing(id: i32, text: &str) -> ChatMessage {
+    ChatMessage {
+        outgoing: true,
+        sender: None,
+        ..message(id, text)
+    }
+}
+
+/// A dialog row as the server sends it, carrying the read state the summary is seeded from.
+pub fn raw_dialog(read_outbox_max_id: i32, unread_count: i32) -> tl::enums::Dialog {
+    tl::enums::Dialog::Dialog(tl::types::Dialog {
+        pinned: false,
+        unread_mark: false,
+        view_forum_as_messages: false,
+        peer: tl::enums::Peer::User(tl::types::PeerUser { user_id: 1 }),
+        top_message: read_outbox_max_id.max(1),
+        read_inbox_max_id: 0,
+        read_outbox_max_id,
+        unread_count,
+        unread_mentions_count: 0,
+        unread_reactions_count: 0,
+        unread_poll_votes_count: 0,
+        notify_settings: tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+            show_previews: None,
+            silent: None,
+            mute_until: None,
+            ios_sound: None,
+            android_sound: None,
+            other_sound: None,
+            stories_muted: None,
+            stories_hide_sender: None,
+            stories_ios_sound: None,
+            stories_android_sound: None,
+            stories_other_sound: None,
+        }),
+        pts: None,
+        draft: None,
+        folder_id: None,
+        ttl_period: None,
+    })
+}
+
+/// The archive row, which stands for a group of chats and carries no read state of its own.
+pub fn raw_folder() -> tl::enums::Dialog {
+    tl::enums::Dialog::Folder(tl::types::DialogFolder {
+        pinned: false,
+        folder: tl::enums::Folder::Folder(tl::types::Folder {
+            autofill_new_broadcasts: false,
+            autofill_public_groups: false,
+            autofill_new_correspondents: false,
+            id: 1,
+            title: "Archived".to_string(),
+            photo: None,
+        }),
+        peer: tl::enums::Peer::User(tl::types::PeerUser { user_id: 1 }),
+        top_message: 1,
+        unread_muted_peers_count: 0,
+        unread_unmuted_peers_count: 3,
+        unread_muted_messages_count: 0,
+        unread_unmuted_messages_count: 7,
+    })
 }
 
 /// An app plus the receiving end of the commands it issues.

@@ -6,6 +6,7 @@ use chrono::{DateTime, Local, Utc};
 use grammers_client::message::Message;
 use grammers_session::types::PeerRef;
 
+use crate::state::call::call_label;
 use crate::state::media::{PhotoRef, media_label, photo_ref};
 
 /// How many messages to request per page, both for the initial load and each scroll-up.
@@ -32,11 +33,17 @@ impl ChatMessage {
         // *can* be drawn the label lives on the `PhotoRef` and only the caption is text, so the
         // transcript prints the label while the download is in flight and drops it once the
         // picture replaces it.
-        let text = match (&media, msg.text()) {
-            (None, text) => text.to_string(),
-            (Some(_), caption) if photo.is_some() => caption.to_string(),
-            (Some(media), "") => media_label(media).to_string(),
-            (Some(media), caption) => format!("{} {caption}", media_label(media)),
+        //
+        // A service message has neither text nor media of its own — only an action — and the one
+        // worth spelling out is a call. Any other action stays blank, as it always has.
+        let text = match msg.action() {
+            Some(action) => call_label(action, msg.outgoing()).unwrap_or_default(),
+            None => match (&media, msg.text()) {
+                (None, text) => text.to_string(),
+                (Some(_), caption) if photo.is_some() => caption.to_string(),
+                (Some(media), "") => media_label(media).to_string(),
+                (Some(media), caption) => format!("{} {caption}", media_label(media)),
+            },
         };
 
         Self {

@@ -266,9 +266,20 @@ impl App {
                     }
                 }
                 if !edited {
+                    let counts = !message.outgoing;
                     self.dialogs.bump(peer.id, message.text);
+                    // An edit is not a new message; our own message echoed back from another
+                    // device is not unread; and a message in the chat on screen has already been
+                    // read, by definition, by the person reading it.
+                    if counts && Some(peer.id) != self.open_chat {
+                        self.dialogs.mark_unread(peer.id);
+                    }
                 }
             }
+            TgEvent::OutgoingRead { peer, max_id } => self.dialogs.mark_outbox_read(peer, max_id),
+            TgEvent::IncomingRead { peer, still_unread } => self
+                .dialogs
+                .reconcile_unread(peer, still_unread.max(0) as usize),
             TgEvent::Error(error) => {
                 self.submitting = false;
                 // Failing the startup check would otherwise strand us on the connecting screen,
@@ -631,6 +642,11 @@ impl App {
             return;
         }
         self.open_chat = Some(peer.id);
+        // Local only, and deliberately so: tgtui never sends a read acknowledgement, so opening a
+        // chat here must not change what the account's other clients — or the sender — see. The
+        // badge is a note to ourselves about this session and nothing more. It has to be cleared
+        // before the cache check below, or a revisit would leave it standing.
+        self.dialogs.clear_unread(peer.id);
 
         // Only the first visit hits the network; revisits reuse the cached buffer.
         match self.chats.entry(peer.id) {
@@ -661,7 +677,8 @@ mod tests {
     use crate::state::chat_buffer::PAGE_SIZE;
     use crate::telegram::TgEvent;
     use crate::test_support::{
-        app, channel, dialog, drain, gradient, message, page, peer, photo_message,
+        app, channel, channel_dialog, dialog, drain, gradient, message, outgoing, page, peer,
+        photo_message,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1452,6 +1469,202 @@ mod tests {
         assert!(
             matches!(photo_state(&app, 1), PhotoState::Ready(_)),
             "an edited caption must not make the picture flicker back to a label"
+        );
+    }
+
+    // -- read state ----------------------------------------------------------
+
+    fn summary(app: &App, peer_id: PeerId) -> &crate::state::dialog_list::DialogSummary {
+        app.dialogs
+            .items
+            .iter()
+            .find(|item| item.peer.id == peer_id)
+            .expect("the fixture loaded this dialog")
+    }
+
+    #[test]
+    fn a_message_arriving_in_a_closed_chat_raises_its_unread_badge() {
+        // `opened_chat` leaves chat 1 open, so chat 2 is the one nobody is looking at.
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: message(1, "you around?"),
+            edited: false,
+        });
+
+        assert_eq!(summary(&app, peer(2).id).unread, 1);
+    }
+
+    #[test]
+    fn a_message_arriving_in_the_open_chat_is_already_read() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(1),
+            message: message(101, "you around?"),
+            edited: false,
+        });
+
+        assert_eq!(
+            summary(&app, peer(1).id).unread,
+            0,
+            "a message on screen has been read, by definition, by the person reading it"
+        );
+    }
+
+    #[test]
+    fn your_own_message_from_another_device_never_counts_as_unread() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: outgoing(1, "sent from the phone"),
+            edited: false,
+        });
+
+        assert_eq!(summary(&app, peer(2).id).unread, 0);
+    }
+
+    #[test]
+    fn an_edit_does_not_count_as_a_new_unread() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: message(1, "fixed the typo"),
+            edited: true,
+        });
+
+        assert_eq!(summary(&app, peer(2).id).unread, 0);
+    }
+
+    #[test]
+    fn opening_a_chat_clears_its_badge_without_telling_telegram() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: message(1, "you around?"),
+            edited: false,
+        });
+        drain(&mut rx);
+
+        app.dialogs.selected = app
+            .dialogs
+            .items
+            .iter()
+            .position(|item| item.peer.id == peer(2).id)
+            .unwrap();
+        app.open_selected_chat();
+
+        assert_eq!(summary(&app, peer(2).id).unread, 0);
+        assert!(
+            matches!(drain(&mut rx).as_slice(), [TgCommand::OpenChat { .. }]),
+            "reading here must stay local: an acknowledgement would mark the conversation read \
+             on the user's phone too, which is not what opening a terminal client means"
+        );
+    }
+
+    #[test]
+    fn reopening_a_cached_chat_still_clears_its_badge() {
+        let (mut app, mut rx) = opened_chat();
+        // Leave and come back, so the buffer is already cached on the second visit.
+        app.dialogs.selected = 1;
+        app.open_selected_chat();
+        app.dialogs.selected = 0;
+        app.open_selected_chat();
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: message(1, "you around?"),
+            edited: false,
+        });
+        drain(&mut rx);
+
+        app.dialogs.selected = app
+            .dialogs
+            .items
+            .iter()
+            .position(|item| item.peer.id == peer(2).id)
+            .unwrap();
+        app.open_selected_chat();
+
+        assert_eq!(
+            summary(&app, peer(2).id).unread,
+            0,
+            "the badge is cleared before the cached-buffer early return, or a revisit leaves it \
+             standing"
+        );
+    }
+
+    #[test]
+    fn a_message_read_by_the_other_side_raises_the_watermark() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::OutgoingRead {
+            peer: peer(1).id,
+            max_id: 97,
+        });
+
+        assert_eq!(summary(&app, peer(1).id).read_outbox_max_id, Some(97));
+    }
+
+    #[test]
+    fn an_outbox_read_names_the_channel_it_belongs_to() {
+        let (mut app, _rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![dialog(7, "Alice"), channel_dialog(7, "Announcements")],
+            exhausted: true,
+        });
+
+        app.handle_event(TgEvent::OutgoingRead {
+            peer: channel(7).id,
+            max_id: 9,
+        });
+
+        assert_eq!(summary(&app, channel(7).id).read_outbox_max_id, Some(9));
+        assert_eq!(
+            summary(&app, peer(7).id).read_outbox_max_id,
+            Some(0),
+            "channel ids restart at 1 per channel and collide with user ids, so the two must \
+             stay distinct peers all the way from the update"
+        );
+    }
+
+    #[test]
+    fn a_read_watermark_for_a_chat_never_opened_is_still_remembered() {
+        let (mut app, _rx) = opened_chat();
+
+        // Chat 2 has no `ChatBuffer` at all — this is the case that rules the buffer out as the
+        // home for read state.
+        app.handle_event(TgEvent::OutgoingRead {
+            peer: peer(2).id,
+            max_id: 12,
+        });
+
+        assert!(!app.chats.contains_key(&peer(2).id));
+        assert_eq!(summary(&app, peer(2).id).read_outbox_max_id, Some(12));
+    }
+
+    #[test]
+    fn reading_elsewhere_reconciles_a_badge_downwards_only() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(2),
+            message: message(1, "you around?"),
+            edited: false,
+        });
+
+        app.handle_event(TgEvent::IncomingRead {
+            peer: peer(2).id,
+            still_unread: 4,
+        });
+
+        assert_eq!(
+            summary(&app, peer(2).id).unread,
+            1,
+            "the server counts from its own read pointer, which tgtui never moves, so its number \
+             can only ever be believed when it is the smaller one"
         );
     }
 }

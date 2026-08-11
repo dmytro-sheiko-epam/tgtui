@@ -16,10 +16,26 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .items
         .iter()
         .map(|dialog| {
-            let name = truncate(&dialog.name, inner_width);
+            // Digits between two spaces, so `len` is the display width here.
+            let badge = (dialog.unread > 0).then(|| format!(" {} ", dialog.unread));
+            let name_width = inner_width.saturating_sub(badge.as_deref().map_or(0, str::len));
+            let name = truncate(&dialog.name, name_width);
             let preview = truncate(&dialog.preview, inner_width);
+
+            // The badge is pushed to the right edge by padding the name out to fill the row.
+            let mut name_line = vec![Span::styled(
+                format!("{name:<name_width$}"),
+                Style::default().bold(),
+            )];
+            if let Some(badge) = badge {
+                name_line.push(Span::styled(
+                    badge,
+                    Style::default().fg(Color::Black).bg(Color::Blue).bold(),
+                ));
+            }
+
             ListItem::new(vec![
-                Line::from(Span::styled(name, Style::default().bold())),
+                Line::from(name_line),
                 Line::from(Span::styled(preview, Style::default().fg(Color::DarkGray))),
             ])
         })

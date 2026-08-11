@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use color_eyre::eyre::{Result, eyre};
 use grammers_client::client::{DialogIter, LoginToken, PasswordToken, UpdatesConfiguration};
+use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::types::PeerId;
@@ -217,6 +218,17 @@ impl Actor {
                 }
             }
 
+            // The seeded read state is the one thing on screen with no local cause, so log what
+            // the server actually said — that is what a wrong tick has to be checked against.
+            for item in &items {
+                tracing::debug!(
+                    name = %item.name,
+                    unread = item.unread,
+                    read_outbox_max_id = ?item.read_outbox_max_id,
+                    "dialog read state"
+                );
+            }
+
             let exhausted = items.len() < dialog_list::PAGE_SIZE;
             let _ = events.send(TgEvent::DialogsLoaded { items, exhausted });
 
@@ -405,6 +417,14 @@ async fn stream_updates(
                 });
                 continue;
             }
+            // Read state never arrives wrapped: grammers builds friendly variants for messages and
+            // bot queries only, so these come through raw.
+            Update::Raw(raw) => {
+                if let Some(event) = read_event(&raw.raw) {
+                    let _ = events.send(event);
+                }
+                continue;
+            }
             _ => continue,
         };
 
@@ -419,4 +439,37 @@ async fn stream_updates(
             edited,
         });
     }
+}
+
+/// Translate the four read-state updates, resolving the peer here so no `tl` type reaches `App`.
+///
+/// Unlike a deletion, every one of these names its chat — the two channel forms by bare id, the
+/// two history forms by a full `Peer` — so there is no peer ambiguity to guard against.
+/// `updateReadChannelDiscussionOutbox` is ignored on purpose: it tracks a comment thread, and
+/// tgtui has no thread view for a tick to belong to.
+fn read_event(update: &tl::enums::Update) -> Option<TgEvent> {
+    use tl::enums::Update as U;
+    let event = match update {
+        U::ReadHistoryOutbox(read) => TgEvent::OutgoingRead {
+            peer: PeerId::from(&read.peer),
+            max_id: read.max_id,
+        },
+        U::ReadChannelOutbox(read) => TgEvent::OutgoingRead {
+            peer: PeerId::channel_unchecked(read.channel_id),
+            max_id: read.max_id,
+        },
+        U::ReadHistoryInbox(read) => TgEvent::IncomingRead {
+            peer: PeerId::from(&read.peer),
+            still_unread: read.still_unread_count,
+        },
+        U::ReadChannelInbox(read) => TgEvent::IncomingRead {
+            peer: PeerId::channel_unchecked(read.channel_id),
+            still_unread: read.still_unread_count,
+        },
+        _ => return None,
+    };
+    // Read state is the one thing on screen that nothing local ever causes, so when a tick looks
+    // wrong the log is the only way to tell "Telegram never said so" from "we decoded it wrong".
+    tracing::debug!(?event, "read state");
+    Some(event)
 }

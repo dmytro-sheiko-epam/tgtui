@@ -96,6 +96,22 @@ from `App`.
 - **The viewer is modal.** While `App.viewer` is set, `handle_main_key` routes everything to
   `handle_viewer_key` and `ui::draw` skips both panes. Without that, keys would fall through to
   the compose box behind it.
+- **Read state is a per-dialog watermark, not per-message.** Telegram has no "seen" flag on a
+  message, only `read_outbox_max_id` per chat, so both fields live on `DialogSummary` — the one
+  structure that exists for every conversation, including ones never opened. `ChatBuffer` knows
+  nothing about it; `render_transcript` reads the watermark off the same dialog lookup it already
+  does for the pane title. Updates apply as a *maximum*, because resolving an update gap can
+  replay an older read after a newer one.
+- **Read receipts are never sent.** Opening a chat clears its badge locally only — there is no
+  `mark_as_read` anywhere in `src/telegram/` and no `TgCommand` that could carry one, so the
+  conversation stays unread on the user's other clients. That is also why
+  `DialogListState::reconcile_unread` takes the `min` of the server's `still_unread_count` rather
+  than assigning it: the server counts from a read pointer tgtui never moves, so its number can
+  only be believed when it is the smaller one. Assigning would resurrect a badge the user cleared.
+- **The tick column is reserved, not conditional.** Outgoing bodies wrap `TICK_GUTTER` columns
+  short whether or not the message has been read, so a receipt changing from ✓ to ✓✓ cannot change
+  a message's line count and therefore cannot move `scroll` under the reader. Same discipline as
+  `ImageStore::reserve`/`prepare` sharing `fit`.
 
 ## Scope
 
@@ -105,6 +121,20 @@ labelled (`[file]`, `[poll]`, …) by `state::media::media_label` and never down
 a picture whose terminal can't draw it. `grammers_client::media::Media` is `#[non_exhaustive]`,
 so keep the catch-all arm. Sending media, editing, deleting, reactions, animation, and multiple
 accounts are deliberately out of scope.
+
+Calls arrive as service messages, which carry neither text nor media, and `state::call::call_label`
+flattens them the same way: `[incoming call · 3:21]`, `[cancelled call]`, `[missed video call]`,
+and, for a group's voice chat, `[video chat started]` / `[video chat ended · 12:03]`. Placing or
+joining one from the terminal is out of scope. Every other service action (joined, pinned, title
+changed) still renders as a blank line — extending `call_label` is where that would change.
+
+Read state is display-only. Outgoing messages carry a `✓` (sent) or `✓✓` (read by the recipient)
+at the right edge of their last line, and each chat-list row shows its unread count. Ticks are
+suppressed in broadcast channels, which have readers rather than a recipient, and in Saved
+Messages, which is you at both ends — `state::dialog_list::receipts_make_sense` decides. Nothing is
+ever acknowledged back to Telegram, so the badge counts from the last time *this* client opened
+the chat and reading elsewhere only ever lowers it. Marking a chat read from the terminal is
+deliberately out of scope; it would change the account's real state on every other device.
 
 Keys: `Ctrl+P` opens the newest picture on screen full screen — a modifier because every plain
 character goes into the compose box — then `←`/`→` step through the chat's pictures and `Esc`

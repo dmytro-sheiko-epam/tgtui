@@ -6,6 +6,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, ChatViewMetrics, Focus};
 use crate::state::chat_buffer::{ChatBuffer, ChatMessage};
@@ -20,6 +21,29 @@ const GROUP_GAP_MINUTES: i64 = 5;
 /// exactly this much so they line up with the name rather than with the timestamp.
 const TIME_WIDTH: usize = 6;
 
+/// Columns a read receipt claims at the right edge. `✓` is padded out to `✓✓`'s width so a message
+/// doesn't shift sideways the moment it is read.
+const TICK_WIDTH: usize = 2;
+
+/// The receipt column plus the space before it. Outgoing bodies wrap short by this much whether or
+/// not this particular message has been read yet — that is what keeps a message's line count, and
+/// so `scroll`, independent of its read state.
+const TICK_GUTTER: usize = TICK_WIDTH + 1;
+
+/// `✓` for delivered, `✓✓` for read.
+///
+/// U+2713 rather than the heavier U+2714: the latter carries the Emoji property, so a terminal
+/// that gives it emoji presentation paints two cells while `unicode_width` still reports one, and
+/// the receipt column would drift.
+fn tick_span(read: bool) -> Span<'static> {
+    let (glyph, colour) = if read {
+        ("✓✓", Color::Cyan)
+    } else {
+        ("✓", Color::DarkGray)
+    };
+    Span::styled(format!("{glyph:>TICK_WIDTH$}"), Style::default().fg(colour))
+}
+
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App, images: &mut ImageStore) {
     let [transcript_area, compose_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
@@ -30,13 +54,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, images: &mut ImageSt
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App, images: &mut ImageStore) {
     let focused = app.focus == Focus::Messages;
-    let title = app
+    // The read watermark rides along on the lookup the pane title already does, which is what
+    // keeps `ChatBuffer` — and so the whole message cache — ignorant of read state.
+    let (title, read_up_to) = app
         .dialogs
         .items
         .iter()
         .find(|item| Some(item.peer.id) == app.open_chat)
-        .map(|item| item.name.clone())
-        .unwrap_or_else(|| "Messages".to_string());
+        .map(|item| (item.name.clone(), item.read_outbox_max_id))
+        .unwrap_or_else(|| ("Messages".to_string(), None));
 
     let block = pane(&title, focused);
     let inner = block.inner(area);
@@ -57,7 +83,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App, images: &mut 
     let max_rows = inline_rows(viewport, app.image_rows);
 
     let transcript = if buffer.loaded {
-        build_transcript(buffer, inner.width as usize, max_rows, images)
+        build_transcript(buffer, read_up_to, inner.width as usize, max_rows, images)
     } else {
         Transcript::from_lines(vec![Line::from(Span::styled(
             "loading messages...",
@@ -156,12 +182,20 @@ impl Transcript {
 
 fn build_transcript(
     buffer: &ChatBuffer,
+    read_up_to: Option<i32>,
     width: usize,
     max_rows: u16,
     images: &mut ImageStore,
 ) -> Transcript {
     // Bodies hang under the sender name, past the timestamp column.
     let body_width = width.saturating_sub(TIME_WIDTH);
+    // Receipts need a column of their own. A pane too narrow to spare one drops them rather than
+    // letting them eat the text.
+    let read_up_to = read_up_to.filter(|_| body_width > TICK_GUTTER);
+    let outgoing_width = match read_up_to {
+        Some(_) => body_width - TICK_GUTTER,
+        None => body_width,
+    };
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut placements: Vec<Placement> = Vec::new();
     let mut photos: Vec<(i32, usize)> = Vec::new();
@@ -199,6 +233,14 @@ fn build_transcript(
             ]));
         }
 
+        // A blank body is a service message we don't spell out, and a receipt hanging off an empty
+        // line is just a tick floating in space.
+        let receipted = message.outgoing && (message.photo.is_some() || !message.text.is_empty());
+        let tick = read_up_to
+            .filter(|_| receipted)
+            // Telegram never marks a single message read; there is only this per-chat watermark.
+            .map(|max_id| tick_span(message.id <= max_id));
+
         // A photo holds its rows open from the moment the message appears, so the transcript
         // doesn't shift when the download lands. The label sits on the top row until it does,
         // and stays there for good if the picture can't be drawn at all.
@@ -231,8 +273,10 @@ fn build_transcript(
 
         let body = match (&message.photo, reserved) {
             // The rows above already carry the label, so only the caption is left — and an
-            // empty one adds nothing but a stray blank line.
-            (Some(_), Some(())) if message.text.is_empty() => None,
+            // empty one adds nothing but a stray blank line. A picture of our own still needs a
+            // line to hang its receipt from, though: the rows above belong to the picture and are
+            // painted over by the image widget, so the tick can't live on them.
+            (Some(_), Some(())) if message.text.is_empty() => tick.is_some().then(String::new),
             (Some(_), Some(())) => Some(message.text.clone()),
             // Nothing can be drawn here: fall back to the flattened label the client has
             // always shown for media.
@@ -242,8 +286,27 @@ fn build_transcript(
         };
 
         if let Some(body) = body {
-            for line in wrap(&body, body_width) {
-                lines.push(Line::from(format!("{:TIME_WIDTH$}{line}", "")));
+            let wrap_width = if tick.is_some() {
+                outgoing_width
+            } else {
+                body_width
+            };
+            // `wrap` always yields at least one line, even for an empty body.
+            let wrapped = wrap(&body, wrap_width);
+            let last = wrapped.len() - 1;
+            for (n, line) in wrapped.into_iter().enumerate() {
+                match (&tick, n == last) {
+                    (Some(tick), true) => {
+                        // Padded by display width, not by char count, so a body holding wide
+                        // glyphs still lands its receipt on the pane edge.
+                        let pad = wrap_width.saturating_sub(line.width());
+                        lines.push(Line::from(vec![
+                            Span::raw(format!("{:TIME_WIDTH$}{line}{:pad$} ", "", "")),
+                            tick.clone(),
+                        ]));
+                    }
+                    _ => lines.push(Line::from(format!("{:TIME_WIDTH$}{line}", ""))),
+                }
             }
         }
         previous = Some(message);
@@ -368,7 +431,7 @@ mod tests {
         // The fixture's messages all share a sender and timestamp, so they form one group.
         buffer.set_initial(page(10, 5));
 
-        let lines = build_transcript(&buffer, 40, ROWS, &mut ImageStore::disabled()).lines;
+        let lines = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled()).lines;
         let headers = lines
             .iter()
             .filter(|line| line.spans.iter().any(|s| s.content.contains("Alice")))
@@ -389,7 +452,7 @@ mod tests {
         buffer.set_initial(vec![]);
         buffer.messages.push_back(at(1, Some("Alice"), false, 0));
 
-        let lines = build_transcript(&buffer, 40, ROWS, &mut ImageStore::disabled()).lines;
+        let lines = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled()).lines;
         let header = &lines[lines.len() - 2];
         let body = lines.last().unwrap().to_string();
 
@@ -412,7 +475,7 @@ mod tests {
         // 100x200 pixels is 10 columns by 10 rows at the half-block font size.
         let buffer = buffer_of(vec![loaded_photo_message(1, "", 100, 200)]);
 
-        let transcript = build_transcript(&buffer, 40, ROWS, &mut ImageStore::for_tests());
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::for_tests());
 
         let placement = transcript
             .images
@@ -432,10 +495,10 @@ mod tests {
         let arrived = buffer_of(vec![loaded_photo_message(1, "", 100, 200)]);
         let mut images = ImageStore::for_tests();
 
-        let before = build_transcript(&waiting, 40, ROWS, &mut images)
+        let before = build_transcript(&waiting, None, 40, ROWS, &mut images)
             .lines
             .len();
-        let after = build_transcript(&arrived, 40, ROWS, &mut images)
+        let after = build_transcript(&arrived, None, 40, ROWS, &mut images)
             .lines
             .len();
 
@@ -449,7 +512,7 @@ mod tests {
     fn a_photo_still_waiting_says_what_it_is() {
         let buffer = buffer_of(vec![photo_message(1, "look at this", 100, 200)]);
 
-        let transcript = build_transcript(&buffer, 40, ROWS, &mut ImageStore::for_tests());
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::for_tests());
         let text = transcript.lines[1].to_string();
 
         assert!(transcript.images.is_empty(), "there is nothing to draw yet");
@@ -460,7 +523,7 @@ mod tests {
     fn a_caption_survives_the_picture_replacing_its_label() {
         let buffer = buffer_of(vec![loaded_photo_message(1, "look at this", 100, 200)]);
 
-        let transcript = build_transcript(&buffer, 40, ROWS, &mut ImageStore::for_tests());
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::for_tests());
         let rendered = transcript
             .lines
             .iter()
@@ -481,7 +544,7 @@ mod tests {
     fn a_terminal_that_cannot_draw_renders_the_label_it_always_did() {
         let buffer = buffer_of(vec![loaded_photo_message(1, "look at this", 100, 200)]);
 
-        let transcript = build_transcript(&buffer, 40, ROWS, &mut ImageStore::disabled());
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
 
         assert!(transcript.images.is_empty());
         assert!(
@@ -547,7 +610,7 @@ mod tests {
             photo_message(3, "", 100, 200),
         ]);
 
-        let transcript = build_transcript(&buffer, 40, ROWS, &mut ImageStore::for_tests());
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::for_tests());
         let (_, second) = transcript.photos[1];
 
         assert_eq!(
@@ -568,12 +631,143 @@ mod tests {
         buffer.messages.push_back(at(1, Some("Alice"), false, 0));
         buffer.messages.push_back(at(2, Some("Alice"), false, 60));
 
-        let headers = build_transcript(&buffer, 40, ROWS, &mut ImageStore::disabled())
+        let headers = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled())
             .lines
             .iter()
             .filter(|line| line.spans.iter().any(|s| s.content.contains("Alice")))
             .count();
 
         assert_eq!(headers, 2);
+    }
+
+    // -- read receipts -------------------------------------------------------
+
+    /// The rendered lines of a chat holding one message of our own, read up to `read_up_to`.
+    fn mine(text: &str, read_up_to: Option<i32>, width: usize) -> Vec<String> {
+        let buffer = buffer_of(vec![ChatMessage {
+            outgoing: true,
+            sender: None,
+            ..message(5, text)
+        }]);
+        build_transcript(
+            &buffer,
+            read_up_to,
+            width,
+            ROWS,
+            &mut ImageStore::disabled(),
+        )
+        .lines
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn an_outgoing_message_gets_one_tick_until_it_is_read() {
+        let lines = mine("on my way", Some(4), 40);
+        assert!(
+            lines.last().unwrap().ends_with('✓'),
+            "a sent message must say so: {lines:?}"
+        );
+        assert!(!lines.last().unwrap().ends_with("✓✓"));
+    }
+
+    #[test]
+    fn a_message_the_other_side_has_read_gets_two_ticks() {
+        let lines = mine("on my way", Some(5), 40);
+        assert!(
+            lines.last().unwrap().ends_with("✓✓"),
+            "the watermark includes this id, so it has been read: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_incoming_message_never_gets_a_tick() {
+        let buffer = buffer_of(vec![at(5, Some("Alice"), false, 0)]);
+
+        let lines = build_transcript(&buffer, Some(99), 40, ROWS, &mut ImageStore::disabled())
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            !lines.iter().any(|line| line.contains('✓')),
+            "a receipt on someone else's message would claim to know what they saw: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_chat_where_a_read_receipt_means_nothing_shows_no_ticks() {
+        let lines = mine("posted", None, 40);
+        assert!(
+            !lines.iter().any(|line| line.contains('✓')),
+            "a broadcast channel has readers, not a recipient: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn reserving_the_tick_column_keeps_the_line_count_independent_of_the_read_state() {
+        // A body long enough to wrap, so a width change would show up as a line count change.
+        let text = "the quick brown fox jumps over the lazy dog and keeps on going for a while";
+        for width in 12..60 {
+            assert_eq!(
+                mine(text, Some(0), width).len(),
+                mine(text, Some(99), width).len(),
+                "a message changing from ✓ to ✓✓ must not change how many lines it occupies, or \
+                 `scroll` moves under the reader the moment the other side opens the chat"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tick_sits_at_the_pane_edge_without_overflowing_it() {
+        let text = "the quick brown fox jumps over the lazy dog";
+        for width in 12..60 {
+            for read_up_to in [Some(0), Some(99)] {
+                for line in mine(text, read_up_to, width) {
+                    assert!(
+                        line.width() <= width,
+                        "{line:?} is wider than the {width}-column pane"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_too_narrow_for_a_tick_drops_it_rather_than_the_text() {
+        // TIME_WIDTH + TICK_GUTTER leaves nothing for the body at this width.
+        let lines = mine("hi", Some(99), TIME_WIDTH + TICK_GUTTER);
+        assert!(
+            !lines.iter().any(|line| line.contains('✓')),
+            "the text has to win the last few columns: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_picture_of_your_own_with_no_caption_still_gets_a_line_for_its_receipt() {
+        let buffer = buffer_of(vec![ChatMessage {
+            outgoing: true,
+            sender: None,
+            ..loaded_photo_message(5, "", 100, 200)
+        }]);
+
+        let transcript = build_transcript(&buffer, Some(5), 40, ROWS, &mut ImageStore::for_tests());
+        let placement = transcript
+            .images
+            .first()
+            .expect("the picture must be drawn");
+
+        assert!(
+            transcript.lines.last().unwrap().to_string().contains("✓✓"),
+            "the image rows are painted over by the widget, so the tick needs a line below them"
+        );
+        assert_eq!(
+            transcript.lines.len() - placement.line,
+            placement.size.height as usize + 1,
+            "exactly one line more than the picture's own rows — the receipt sits where a \
+             caption would, and the picture must still claim exactly the rows it covers"
+        );
     }
 }
