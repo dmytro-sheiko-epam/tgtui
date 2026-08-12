@@ -18,7 +18,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .map(|dialog| {
             // Digits between two spaces, so `len` is the display width here.
             let badge = (dialog.unread > 0).then(|| format!(" {} ", dialog.unread));
-            let name_width = inner_width.saturating_sub(badge.as_deref().map_or(0, str::len));
+            // ASCII, so the width arithmetic below stays honest in terminals that render an
+            // emoji speaker or pushpin as two columns.
+            let marks = match (dialog.pinned, dialog.muted) {
+                (true, true) => "^~",
+                (true, false) => "^ ",
+                (false, true) => "~ ",
+                (false, false) => "",
+            };
+            let used = badge.as_deref().map_or(0, str::len) + marks.len();
+            let name_width = inner_width.saturating_sub(used);
             let name = truncate(&dialog.name, name_width);
             let preview = truncate(&dialog.preview, inner_width);
 
@@ -27,10 +36,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 format!("{name:<name_width$}"),
                 Style::default().bold(),
             )];
+            if !marks.is_empty() {
+                name_line.push(Span::styled(marks, Style::default().fg(Color::DarkGray)));
+            }
             if let Some(badge) = badge {
                 name_line.push(Span::styled(
                     badge,
-                    Style::default().fg(Color::Black).bg(Color::Blue).bold(),
+                    // A muted chat still counts, but it has already said it will not interrupt —
+                    // so the count stays and the colour stops shouting.
+                    if dialog.muted {
+                        Style::default().fg(Color::Black).bg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::Black).bg(Color::Blue).bold()
+                    },
                 ));
             }
 

@@ -81,6 +81,42 @@ pub enum TgEvent {
         peer: PeerId,
         still_unread: i32,
     },
+    // -- chat actions --------------------------------------------------------
+    //
+    // Applied when the server confirms, never optimistically: a mute that silently failed but
+    // showed as muted would be a lie about the account's real state. The wait is a round trip, and
+    // the status banner narrates it.
+    //
+    // Each also arrives unprompted when the change was made on another device, which is why they
+    // carry the new value rather than meaning "the thing you asked for happened".
+    MuteChanged {
+        peer: PeerId,
+        muted: bool,
+    },
+    PinChanged {
+        peer: PeerId,
+        pinned: bool,
+    },
+    BlockedChanged {
+        peer: PeerId,
+        blocked: bool,
+    },
+    /// The account's blocked list, as one answer for every dialog at once.
+    BlockedPeersLoaded {
+        peers: Vec<PeerId>,
+    },
+    /// The chat's own history is gone but the conversation remains.
+    HistoryCleared {
+        peer: PeerId,
+    },
+    /// The conversation is no longer in the main list — deleted, left, or archived. The app treats
+    /// all three the same way, because from the list's point of view they are the same thing.
+    DialogGone {
+        peer: PeerId,
+        /// What to tell the user, since the three reasons read very differently.
+        reason: &'static str,
+    },
+
     /// A non-fatal problem worth surfacing in the status banner.
     Error(String),
 }

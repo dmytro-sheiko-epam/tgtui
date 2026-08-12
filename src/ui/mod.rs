@@ -4,6 +4,7 @@ pub mod chat_list;
 pub mod chat_view;
 pub mod images;
 pub mod login;
+pub mod menu;
 pub mod photo_view;
 pub mod text;
 pub mod widgets;
@@ -32,6 +33,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, images: &mut ImageStore) {
 
             chat_list::render(frame, list_area, app);
             chat_view::render(frame, chat_area, app, images);
+
+            // Last, and over the whole body: the menu floats, and the list underneath is the
+            // context for what it is about to do.
+            if let Some(menu) = &app.menu {
+                menu::render(frame, body, menu);
+            }
         }
         _ => login::render(frame, body, app),
     }
@@ -53,11 +60,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if matches!(app.screen, Screen::Main) {
         let hints = if app.viewer.is_some() {
             " ←/→ previous/next picture · Esc close"
+        } else if let Some(menu) = &app.menu {
+            // While a question is up the only two keys that do anything are `y` and `n`, so
+            // offering the menu's own keys here would be a lie.
+            if menu.confirming.is_some() {
+                " y confirm · n cancel"
+            } else {
+                " ↑/↓ select · Enter do it · Esc close"
+            }
         } else {
             match app.focus {
-                Focus::Chats => " ↑/↓ select · Enter open · Tab compose · Ctrl+C quit",
+                Focus::Chats => {
+                    " ↑/↓ select · Enter open · Ctrl+A actions · Tab compose · Ctrl+C quit"
+                }
                 Focus::Messages => {
-                    " type to write · Enter send · ↑/↓ scroll · Ctrl+P picture · Tab/Esc back"
+                    " type to write · Enter send · ↑/↓ scroll · Ctrl+P picture · Ctrl+A actions · Tab/Esc back"
                 }
             }
         };
@@ -78,7 +95,9 @@ mod tests {
     use crate::app::App;
     use crate::state::chat_buffer::PAGE_SIZE;
     use crate::telegram::TgEvent;
-    use crate::test_support::{app, dialog, loaded_photo_message, message, page, peer};
+    use crate::test_support::{
+        app, channel_dialog, dialog, loaded_photo_message, message, page, peer,
+    };
 
     /// Render an app to a fixed-size test terminal and return the screen as text.
     fn screen(app: &mut App) -> String {
@@ -304,5 +323,122 @@ mod tests {
             screen.contains("Bob") && screen.contains(" 2 "),
             "the badge must show how many are waiting:\n{screen}"
         );
+    }
+
+    // -- the chat action menu ------------------------------------------------
+
+    fn with_menu(app: &mut App) -> String {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        screen(app)
+    }
+
+    #[test]
+    fn the_menu_floats_over_the_panes_rather_than_replacing_them() {
+        let mut app = loaded_app();
+
+        let screen = with_menu(&mut app);
+
+        assert!(screen.contains("Mute"), "the menu is missing:\n{screen}");
+        assert!(screen.contains("Delete chat"), "{screen}");
+        assert!(
+            screen.contains("Bob"),
+            "the list underneath is the context for the action, so it must stay visible:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_menu_names_the_chat_it_will_act_on() {
+        let mut app = loaded_app();
+        assert!(with_menu(&mut app).contains("Alice"));
+    }
+
+    #[test]
+    fn a_channel_menu_says_leave_channel() {
+        let (mut app, _rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![channel_dialog(9, "Rust Blog")],
+            exhausted: true,
+        });
+
+        let screen = with_menu(&mut app);
+
+        assert!(screen.contains("Leave channel"), "{screen}");
+        assert!(
+            !screen.contains("Clear history"),
+            "a broadcast channel has no copy of its history that is yours to clear:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_replaces_the_menu_and_says_which_keys_answer_it() {
+        let mut app = loaded_app();
+        with_menu(&mut app);
+        // Walk to "Delete chat", the last entry, and pick it.
+        for _ in 0..5 {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::empty(),
+            ));
+        }
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+
+        let screen = screen(&mut app);
+        assert!(screen.contains("Confirm"), "{screen}");
+        assert!(screen.contains("Delete the chat with Alice?"), "{screen}");
+        assert!(
+            screen.contains("y confirm"),
+            "the footer must say how to answer:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Archive"),
+            "an unanswered question must not leave the menu behind it clickable:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_muted_or_pinned_chat_is_marked_in_the_list() {
+        let mut app = loaded_app();
+        app.handle_event(TgEvent::MuteChanged {
+            peer: peer(2).id,
+            muted: true,
+        });
+        app.handle_event(TgEvent::PinChanged {
+            peer: peer(2).id,
+            pinned: true,
+        });
+        // Clear the status banner so the row markers are what the assertion is reading.
+        app.status = None;
+
+        let screen = screen(&mut app);
+        let row = screen
+            .lines()
+            .find(|line| line.contains("Bob"))
+            .unwrap_or_default();
+        assert!(row.contains('~'), "no mute marker on the row: {row:?}");
+        assert!(row.contains('^'), "no pin marker on the row: {row:?}");
+    }
+
+    #[test]
+    fn the_menu_does_not_panic_in_a_terminal_with_no_room() {
+        let mut app = loaded_app();
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+
+        for (width, height) in [(20, 5), (40, 3), (200, 60), (10, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut images = ImageStore::disabled();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut images))
+                .unwrap();
+        }
     }
 }

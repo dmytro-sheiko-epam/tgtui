@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::app::App;
 use crate::state::chat_buffer::ChatMessage;
+use crate::state::dialog_actions::DialogKind;
 use crate::state::dialog_list::DialogSummary;
 use crate::state::media::{PhotoState, photo_ref};
 use crate::telegram::TgCommand;
@@ -192,17 +193,35 @@ pub fn page(newest_id: i32, count: i32) -> Vec<ChatMessage> {
 pub fn dialog(id: i64, name: &str) -> DialogSummary {
     DialogSummary {
         peer: peer(id),
+        kind: DialogKind::User { is_self: false },
         name: name.to_string(),
         preview: format!("last from {name}"),
         read_outbox_max_id: Some(0),
         unread: 0,
+        muted: false,
+        pinned: false,
+        blocked: false,
     }
 }
 
 /// The same, for a channel — whose bare id shares a number space with a user's.
+///
+/// The watermark is left in place. A real broadcast channel would have none, but these fields are
+/// set independently here: the tests that use this fixture are about telling two peers with the
+/// same bare id apart, and they need something to tell apart.
 pub fn channel_dialog(id: i64, name: &str) -> DialogSummary {
     DialogSummary {
         peer: channel(id),
+        kind: DialogKind::Channel,
+        ..dialog(id, name)
+    }
+}
+
+/// A megagroup: a channel-shaped peer that is still a group to the action menu.
+pub fn group_dialog(id: i64, name: &str) -> DialogSummary {
+    DialogSummary {
+        peer: channel(id),
+        kind: DialogKind::Group { megagroup: true },
         ..dialog(id, name)
     }
 }
@@ -218,8 +237,18 @@ pub fn outgoing(id: i32, text: &str) -> ChatMessage {
 
 /// A dialog row as the server sends it, carrying the read state the summary is seeded from.
 pub fn raw_dialog(read_outbox_max_id: i32, unread_count: i32) -> tl::enums::Dialog {
+    raw_dialog_with(read_outbox_max_id, unread_count, false, None)
+}
+
+/// The same, with the pin flag and the mute deadline the notify state is seeded from.
+pub fn raw_dialog_with(
+    read_outbox_max_id: i32,
+    unread_count: i32,
+    pinned: bool,
+    mute_until: Option<i32>,
+) -> tl::enums::Dialog {
     tl::enums::Dialog::Dialog(tl::types::Dialog {
-        pinned: false,
+        pinned,
         unread_mark: false,
         view_forum_as_messages: false,
         peer: tl::enums::Peer::User(tl::types::PeerUser { user_id: 1 }),
@@ -233,7 +262,7 @@ pub fn raw_dialog(read_outbox_max_id: i32, unread_count: i32) -> tl::enums::Dial
         notify_settings: tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
             show_previews: None,
             silent: None,
-            mute_until: None,
+            mute_until,
             ios_sound: None,
             android_sound: None,
             other_sound: None,

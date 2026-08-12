@@ -132,6 +132,20 @@ impl ChatBuffer {
         self.messages.len() != before
     }
 
+    /// Empty the buffer after the history was cleared on the server.
+    ///
+    /// Kept rather than dropped: the conversation is still open and still in the list, and a
+    /// dropped buffer would send the next frame back to the network for a page that no longer
+    /// exists. `has_more_older` goes false for the same reason — there is provably nothing behind
+    /// this, so scrolling up must not start paginating an empty history.
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.has_more_older = false;
+        self.loading_older = false;
+        self.loaded = true;
+        self.scroll = 0;
+    }
+
     /// Append a message that arrived live, ignoring one we already hold.
     pub fn push_newest(&mut self, message: ChatMessage) {
         if self.messages.iter().any(|m| m.id == message.id) {

@@ -5,10 +5,11 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use grammers_session::types::{PeerId, PeerKind};
+use grammers_session::types::{PeerId, PeerKind, PeerRef};
 use tokio::sync::mpsc;
 
 use crate::state::chat_buffer::ChatBuffer;
+use crate::state::dialog_actions::{DialogAction, DialogKind, actions_for};
 use crate::state::dialog_list::DialogListState;
 use crate::state::media::{PhotoRef, PhotoSource, PhotoState};
 use crate::telegram::{TgCommand, TgEvent};
@@ -73,6 +74,34 @@ impl ChatViewMetrics {
     }
 }
 
+/// The chat action menu, open over the chat list.
+///
+/// Carries the peer it was opened on rather than reading the selection when a key is pressed: the
+/// list reorders itself under live updates, and an action must land on the conversation the user
+/// was looking at when they opened the menu.
+#[derive(Debug)]
+pub struct ChatMenu {
+    pub peer: PeerRef,
+    pub kind: DialogKind,
+    pub name: String,
+    pub actions: Vec<DialogAction>,
+    pub selected: usize,
+    /// The action waiting on a yes or no. Set only for the ones that cannot be undone from here.
+    pub confirming: Option<DialogAction>,
+}
+
+impl ChatMenu {
+    pub fn action(&self) -> Option<DialogAction> {
+        self.actions.get(self.selected).copied()
+    }
+
+    /// The question on screen, if one is pending.
+    pub fn prompt(&self) -> Option<String> {
+        self.confirming
+            .map(|action| action.confirm_prompt(self.kind, &self.name))
+    }
+}
+
 pub struct App {
     pub screen: Screen,
     /// Text being typed on whichever login screen is active.
@@ -90,6 +119,8 @@ pub struct App {
     /// The picture being examined full screen. Modal: while it is set, keys go to the viewer and
     /// the transcript is not drawn at all.
     pub viewer: Option<i32>,
+    /// The chat action menu. Modal too, but a popup: the panes stay drawn behind it.
+    pub menu: Option<ChatMenu>,
     /// `TGTUI_IMAGE_ROWS`, if set: an absolute cap on how tall an inline picture may be.
     pub image_rows: Option<u16>,
     /// Photo messages the last frame actually drew, in transcript order so the newest is last.
@@ -117,6 +148,7 @@ impl App {
             focus: Focus::Chats,
             metrics: ChatViewMetrics::default(),
             viewer: None,
+            menu: None,
             image_rows: None,
             visible_photos: Vec::new(),
             should_quit: false,
@@ -276,6 +308,42 @@ impl App {
                     }
                 }
             }
+            // Chat actions. Each also arrives unprompted when the change was made on another
+            // device, which is why they carry the new value rather than confirming a request.
+            TgEvent::MuteChanged { peer, muted } => {
+                self.dialogs.set_muted(peer, muted);
+                self.set_status(if muted { "muted" } else { "unmuted" }, StatusKind::Info);
+            }
+            TgEvent::PinChanged { peer, pinned } => {
+                self.dialogs.set_pinned(peer, pinned);
+                self.set_status(if pinned { "pinned" } else { "unpinned" }, StatusKind::Info);
+            }
+            TgEvent::BlockedChanged { peer, blocked } => {
+                self.dialogs.set_blocked(peer, blocked);
+                // Unlike mute and pin this leaves no mark on the row, so the banner is the only
+                // evidence the user gets that anything happened.
+                self.set_status(
+                    if blocked {
+                        "user blocked"
+                    } else {
+                        "user unblocked"
+                    },
+                    StatusKind::Info,
+                );
+            }
+            TgEvent::BlockedPeersLoaded { peers } => self.dialogs.set_blocked_list(&peers),
+            TgEvent::HistoryCleared { peer } => {
+                if let Some(buffer) = self.chats.get_mut(&peer) {
+                    buffer.clear();
+                }
+                // The row keeps its place in the list but has nothing left to preview, and a chat
+                // with no messages has nothing left unread either.
+                self.dialogs.clear_preview(peer);
+                self.dialogs.clear_unread(peer);
+                self.set_status("history cleared", StatusKind::Info);
+            }
+            TgEvent::DialogGone { peer, reason } => self.forget_dialog(peer, reason),
+
             TgEvent::OutgoingRead { peer, max_id } => self.dialogs.mark_outbox_read(peer, max_id),
             TgEvent::IncomingRead { peer, still_unread } => self
                 .dialogs
@@ -326,6 +394,33 @@ impl App {
         }
     }
 
+    /// Drop a conversation that has left the main list — deleted, left, or archived.
+    ///
+    /// All three are the same event as far as the list is concerned; only the wording differs.
+    fn forget_dialog(&mut self, peer: PeerId, reason: &str) {
+        let name = self.dialogs.find(peer).map(|item| item.name.clone());
+        if !self.dialogs.remove(peer) {
+            return;
+        }
+        self.chats.remove(&peer);
+
+        // The chat pane may be showing a conversation that is no longer in the list. `remove` has
+        // already left the selection somewhere valid, so following it is enough — and the compose
+        // box has to be emptied, or a half-typed line would be sent into the next chat.
+        if self.open_chat == Some(peer) {
+            self.open_chat = None;
+            self.viewer = None;
+            self.compose.clear();
+            self.focus = Focus::Chats;
+            self.open_selected_chat();
+        }
+
+        match name {
+            Some(name) => self.set_status(format!("{name} — {reason}"), StatusKind::Info),
+            None => self.set_status(reason.to_string(), StatusKind::Info),
+        }
+    }
+
     fn enter_main(&mut self) {
         self.submitting = false;
         self.login_error = None;
@@ -333,6 +428,9 @@ impl App {
         self.screen = Screen::Main;
         self.dialogs.loading = true;
         self.send(TgCommand::LoadMoreDialogs);
+        // Nothing on a dialog row says whether a user is blocked, so the action menu would have no
+        // way to offer "Unblock" without this.
+        self.send(TgCommand::LoadBlockedPeers);
     }
 
     // -- keyboard ------------------------------------------------------------
@@ -381,17 +479,32 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) {
-        // Ctrl+P rather than a letter: with the message pane focused every plain character goes
+        // Chords rather than letters: with the message pane focused every plain character goes
         // into the compose box.
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // The viewer is modal and full screen — nothing behind it is reachable, and nothing it
+        // swallows can leak into the compose box.
+        if self.viewer.is_some() {
+            if ctrl && key.code == KeyCode::Char('p') {
+                return self.toggle_viewer();
+            }
+            return self.handle_viewer_key(key);
+        }
+
+        // The menu is modal too. Its keys are claimed before anything else, or `j`, `k`, `y` and
+        // `n` would fall through into the compose box behind the popup.
+        if self.menu.is_some() {
+            return self.handle_menu_key(key);
+        }
+
         if ctrl && key.code == KeyCode::Char('p') {
             return self.toggle_viewer();
         }
-
-        // The viewer is modal — nothing behind it is reachable, and nothing it swallows can
-        // leak into the compose box.
-        if self.viewer.is_some() {
-            return self.handle_viewer_key(key);
+        // Deliberately after the viewer check: with a picture open the chat list is not drawn at
+        // all, and a menu over it would be acting on something the user cannot see.
+        if ctrl && key.code == KeyCode::Char('a') {
+            return self.open_menu();
         }
 
         match key.code {
@@ -539,6 +652,92 @@ impl App {
         }
     }
 
+    // -- the chat action menu ------------------------------------------------
+
+    fn open_menu(&mut self) {
+        let Some(summary) = self.dialogs.selected_summary() else {
+            return self.set_status("no chat selected", StatusKind::Info);
+        };
+
+        self.menu = Some(ChatMenu {
+            peer: summary.peer,
+            kind: summary.kind,
+            name: summary.name.clone(),
+            actions: actions_for(summary.kind, summary.muted, summary.pinned, summary.blocked),
+            selected: 0,
+            confirming: None,
+        });
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+
+        // A pending confirmation takes the keyboard entirely. An unanswered "Leave channel?" must
+        // not be dismissed by an arrow key, and `Esc` here means "no", not "close the menu".
+        if let Some(pending) = menu.confirming {
+            match key.code {
+                KeyCode::Char('y' | 'Y') => {
+                    menu.confirming = None;
+                    self.run_action(pending);
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => menu.confirming = None,
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.menu = None,
+            KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(menu.actions.len().saturating_sub(1));
+            }
+            KeyCode::Enter => match menu.action() {
+                Some(action) if action.is_destructive() => menu.confirming = Some(action),
+                Some(action) => self.run_action(action),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Send the command an action stands for, and close the menu.
+    ///
+    /// Nothing is applied to the list here. The reducers do that when the server confirms — a mute
+    /// that quietly failed but showed as muted would be a lie about the account's real state, and
+    /// this is the one part of the app whose state is shared with the user's other devices.
+    fn run_action(&mut self, action: DialogAction) {
+        let Some(menu) = self.menu.take() else {
+            return;
+        };
+        let peer = menu.peer;
+
+        self.send(match action {
+            DialogAction::Mute => TgCommand::SetMuted { peer, muted: true },
+            DialogAction::Unmute => TgCommand::SetMuted { peer, muted: false },
+            DialogAction::Pin => TgCommand::SetPinned { peer, pinned: true },
+            DialogAction::Unpin => TgCommand::SetPinned {
+                peer,
+                pinned: false,
+            },
+            DialogAction::Archive => TgCommand::Archive { peer },
+            DialogAction::ClearHistory => TgCommand::ClearHistory { peer },
+            DialogAction::Block => TgCommand::SetBlocked {
+                peer,
+                blocked: true,
+            },
+            DialogAction::Unblock => TgCommand::SetBlocked {
+                peer,
+                blocked: false,
+            },
+            DialogAction::DeleteOrLeave => TgCommand::DeleteDialog { peer },
+        });
+
+        self.set_status(action.in_progress(), StatusKind::Info);
+    }
+
     // -- the full-screen viewer ----------------------------------------------
 
     fn handle_viewer_key(&mut self, key: KeyEvent) {
@@ -677,8 +876,8 @@ mod tests {
     use crate::state::chat_buffer::PAGE_SIZE;
     use crate::telegram::TgEvent;
     use crate::test_support::{
-        app, channel, channel_dialog, dialog, drain, gradient, message, outgoing, page, peer,
-        photo_message,
+        app, channel, channel_dialog, dialog, drain, gradient, group_dialog, message, outgoing,
+        page, peer, photo_message,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -720,7 +919,7 @@ mod tests {
         assert!(matches!(app.screen, Screen::Main));
         assert!(matches!(
             drain(&mut rx).as_slice(),
-            [TgCommand::LoadMoreDialogs]
+            [TgCommand::LoadMoreDialogs, TgCommand::LoadBlockedPeers]
         ));
     }
 
@@ -758,6 +957,7 @@ mod tests {
                 TgCommand::SignIn { .. },
                 TgCommand::CheckPassword { .. },
                 TgCommand::LoadMoreDialogs,
+                TgCommand::LoadBlockedPeers,
             ]
         ));
     }
@@ -1666,5 +1866,283 @@ mod tests {
             "the server counts from its own read pointer, which tgtui never moves, so its number \
              can only ever be believed when it is the smaller one"
         );
+    }
+
+    // -- the chat action menu ------------------------------------------------
+
+    /// Open the menu on the selected chat and return the labels it offers.
+    fn menu_labels(app: &App) -> Vec<&'static str> {
+        let menu = app.menu.as_ref().expect("the menu should be open");
+        menu.actions
+            .iter()
+            .map(|action| action.label(menu.kind))
+            .collect()
+    }
+
+    /// Walk the menu selection down to the entry with this label.
+    fn select_action(app: &mut App, label: &str) {
+        let menu = app.menu.as_ref().expect("the menu should be open");
+        let at = menu
+            .actions
+            .iter()
+            .position(|action| action.label(menu.kind) == label)
+            .unwrap_or_else(|| panic!("no {label:?} in {:?}", menu_labels(app)));
+        for _ in 0..at {
+            app.handle_key(key(KeyCode::Down));
+        }
+    }
+
+    #[test]
+    fn ctrl_a_opens_the_menu_on_the_selected_chat() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_key(ctrl(KeyCode::Char('a')));
+
+        assert_eq!(app.menu.as_ref().unwrap().name, "Alice");
+        assert!(menu_labels(&app).contains(&"Delete chat"));
+    }
+
+    #[test]
+    fn a_group_offers_leave_rather_than_delete() {
+        let (mut app, _rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![group_dialog(5, "Rust Users")],
+            exhausted: true,
+        });
+
+        app.handle_key(ctrl(KeyCode::Char('a')));
+
+        let labels = menu_labels(&app);
+        assert!(labels.contains(&"Leave group"), "{labels:?}");
+        assert!(!labels.contains(&"Delete chat"), "{labels:?}");
+    }
+
+    /// Without the modal check in `handle_main_key`, every one of these would end up in the
+    /// compose box behind the popup.
+    #[test]
+    fn the_menu_swallows_the_keys_the_compose_box_would_otherwise_take() {
+        let (mut app, _rx) = opened_chat();
+        app.focus = Focus::Messages;
+        app.handle_key(ctrl(KeyCode::Char('a')));
+
+        for ch in ['j', 'k', 'y', 'n', 'q'] {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        assert!(
+            app.compose.is_empty(),
+            "menu keys leaked into the compose box: {:?}",
+            app.compose
+        );
+    }
+
+    #[test]
+    fn a_reversible_action_goes_out_as_soon_as_it_is_picked() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        select_action(&mut app, "Mute");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::SetMuted { muted: true, .. }]
+        ));
+        assert!(
+            app.menu.is_none(),
+            "the menu closes once the action is sent"
+        );
+    }
+
+    #[test]
+    fn a_destructive_action_asks_before_anything_leaves_the_app() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        select_action(&mut app, "Delete chat");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing may go out until the question is answered"
+        );
+        assert!(app.menu.as_ref().unwrap().prompt().is_some());
+    }
+
+    #[test]
+    fn answering_no_leaves_the_menu_open_and_sends_nothing() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        select_action(&mut app, "Delete chat");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert!(drain(&mut rx).is_empty());
+        let menu = app
+            .menu
+            .as_ref()
+            .expect("cancelling a question is not cancelling the menu");
+        assert!(menu.confirming.is_none());
+    }
+
+    /// `Esc` closes the menu, but with a question up it has to mean "no" instead — otherwise the
+    /// habit of pressing it to back out would be indistinguishable from answering.
+    #[test]
+    fn escape_answers_the_question_rather_than_closing_the_menu() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        select_action(&mut app, "Delete chat");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.menu.is_some());
+        assert!(app.menu.as_ref().unwrap().confirming.is_none());
+    }
+
+    #[test]
+    fn answering_yes_sends_the_command_and_closes_the_menu() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        select_action(&mut app, "Delete chat");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::DeleteDialog { .. }]
+        ));
+        assert!(app.menu.is_none());
+    }
+
+    /// The account's real state is shared with every other device, so the list must never claim a
+    /// change the server has not made.
+    #[test]
+    fn nothing_shows_as_changed_until_the_server_confirms_it() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        select_action(&mut app, "Mute");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            !summary(&app, peer(1).id).muted,
+            "a mute that quietly failed but showed as muted would be a lie about the account"
+        );
+
+        app.handle_event(TgEvent::MuteChanged {
+            peer: peer(1).id,
+            muted: true,
+        });
+
+        assert!(summary(&app, peer(1).id).muted);
+    }
+
+    /// The list reorders itself under live updates, so reading the selection when the key is
+    /// pressed would let an action land on a conversation that merely moved under the highlight.
+    #[test]
+    fn the_menu_acts_on_the_chat_it_was_opened_on() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+
+        // Whatever the list does now, the pending action still belongs to Alice.
+        app.dialogs.selected = 1;
+        select_action(&mut app, "Mute");
+        app.handle_key(key(KeyCode::Enter));
+
+        match drain(&mut rx).as_slice() {
+            [TgCommand::SetMuted { peer: target, .. }] => assert_eq!(target.id, peer(1).id),
+            other => panic!("expected one mute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clearing_the_history_empties_the_transcript_but_keeps_the_chat() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::HistoryCleared { peer: peer(1).id });
+
+        assert!(app.chats[&peer(1).id].messages.is_empty());
+        assert!(
+            !app.chats[&peer(1).id].has_more_older,
+            "there is provably nothing behind an emptied history, so scrolling up must not start \
+             paginating it"
+        );
+        assert_eq!(app.open_chat, Some(peer(1).id), "the chat is still open");
+        assert!(
+            app.dialogs.find(peer(1).id).is_some(),
+            "and still in the list"
+        );
+    }
+
+    #[test]
+    fn leaving_the_open_chat_closes_it_and_moves_to_another() {
+        let (mut app, _rx) = opened_chat();
+        app.focus = Focus::Messages;
+        app.compose = "half a thought".to_string();
+
+        app.handle_event(TgEvent::DialogGone {
+            peer: peer(1).id,
+            reason: "left",
+        });
+
+        assert!(app.dialogs.find(peer(1).id).is_none());
+        assert!(!app.chats.contains_key(&peer(1).id));
+        assert_eq!(
+            app.open_chat,
+            Some(peer(2).id),
+            "the pane must follow the selection rather than keep showing a chat that is gone"
+        );
+        assert!(
+            app.compose.is_empty(),
+            "a half-typed line must not be carried into the chat that replaced it"
+        );
+    }
+
+    #[test]
+    fn leaving_the_last_chat_leaves_nothing_open_and_does_not_panic() {
+        let (mut app, _rx) = app();
+        app.handle_event(TgEvent::Authorized(true));
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![dialog(1, "Alice")],
+            exhausted: true,
+        });
+
+        app.handle_event(TgEvent::DialogGone {
+            peer: peer(1).id,
+            reason: "deleted",
+        });
+
+        assert!(app.dialogs.items.is_empty());
+        assert_eq!(app.open_chat, None);
+        assert_eq!(app.dialogs.selected, 0);
+    }
+
+    /// With a picture open the chat list is not drawn at all, so a menu over it would be acting
+    /// on something the user cannot see.
+    #[test]
+    fn the_viewer_keeps_the_menu_shut() {
+        let (mut app, _rx) = viewable_chat(2);
+        app.handle_key(ctrl(KeyCode::Char('p')));
+        assert!(app.viewer.is_some());
+
+        app.handle_key(ctrl(KeyCode::Char('a')));
+
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn the_blocked_list_decides_which_face_the_block_entry_shows() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::BlockedPeersLoaded {
+            peers: vec![peer(1).id],
+        });
+        app.handle_key(ctrl(KeyCode::Char('a')));
+
+        assert!(menu_labels(&app).contains(&"Unblock user"));
     }
 }

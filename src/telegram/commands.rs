@@ -41,6 +41,41 @@ pub enum TgCommand {
         peer: PeerRef,
         text: String,
     },
+
+    // -- chat actions --------------------------------------------------------
+    //
+    // Every one of these changes the account's real state and is visible on the user's other
+    // devices. None is issued without the user picking it out of the action menu, and the
+    // irreversible ones pass a confirmation prompt first.
+    /// Silence or unsilence a chat's notifications.
+    SetMuted {
+        peer: PeerRef,
+        muted: bool,
+    },
+    SetPinned {
+        peer: PeerRef,
+        pinned: bool,
+    },
+    /// Move a chat into the archive folder. One-way: `iter_dialogs` only asks for folder 0, so an
+    /// archived chat is not in the list to be brought back.
+    Archive {
+        peer: PeerRef,
+    },
+    /// Empty our copy of a chat's history, leaving the conversation in the list.
+    ClearHistory {
+        peer: PeerRef,
+    },
+    /// Delete a private chat, or leave a group or channel — one call for all three.
+    DeleteDialog {
+        peer: PeerRef,
+    },
+    SetBlocked {
+        peer: PeerRef,
+        blocked: bool,
+    },
+    /// Read the account's blocked list once, so Block/Unblock knows which face to show.
+    LoadBlockedPeers,
+
     /// Close the connection and let the sender pool wind down.
     Shutdown,
 }

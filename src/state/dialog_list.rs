@@ -1,10 +1,12 @@
 //! The chat list: dialog summaries plus the cursor for lazily loading more of them.
 
-use grammers_client::peer::{Dialog, Peer};
+use chrono::Utc;
+use grammers_client::peer::Dialog;
 use grammers_client::tl;
 use grammers_session::types::{PeerId, PeerRef};
 
 use crate::state::call::call_label;
+use crate::state::dialog_actions::DialogKind;
 
 /// How many dialogs to pull per page.
 pub const PAGE_SIZE: usize = 30;
@@ -15,15 +17,26 @@ const PREFETCH_MARGIN: usize = 5;
 #[derive(Debug, Clone)]
 pub struct DialogSummary {
     pub peer: PeerRef,
+    /// Which of user / group / channel this is, decided once from grammers' `Peer` — `PeerKind`
+    /// alone cannot tell a broadcast channel from a megagroup, and the action menu needs to.
+    pub kind: DialogKind,
     pub name: String,
     pub preview: String,
     /// Highest id of ours the other side has read, or `None` where a receipt would mean nothing —
-    /// see `receipts_make_sense`. Telegram never reports a per-message read flag, only this
-    /// per-chat watermark, so it is the whole basis for the ✓✓ in the transcript.
+    /// see [`DialogKind::receipts_make_sense`]. Telegram never reports a per-message read flag,
+    /// only this per-chat watermark, so it is the whole basis for the ✓✓ in the transcript.
     pub read_outbox_max_id: Option<i32>,
     /// Incoming messages not yet read. Seeded from the server, then maintained locally: tgtui
     /// never acknowledges a read, so this counts from the last time *this* client looked.
     pub unread: usize,
+    /// Notifications silenced. Display-only here — tgtui raises no notifications to suppress —
+    /// but it is the account's real setting, shared with every other client.
+    pub muted: bool,
+    pub pinned: bool,
+    /// Whether this user is on the account's blocked list. Unlike the others this is *not* on the
+    /// dialog row, so it stays `false` until `contacts.getBlocked` answers. Always `false` for a
+    /// group or channel, which cannot be blocked.
+    pub blocked: bool,
 }
 
 impl DialogSummary {
@@ -51,15 +64,21 @@ impl DialogSummary {
             })
             .unwrap_or_default();
 
-        let (read_outbox_max_id, unread) =
-            read_state(&dialog.raw, receipts_make_sense(dialog.peer()));
+        let kind = DialogKind::of(dialog.peer());
+        let (read_outbox_max_id, unread) = read_state(&dialog.raw, kind.receipts_make_sense());
+        let (pinned, muted) = notify_state(&dialog.raw, Utc::now().timestamp());
 
         Self {
             peer: dialog.peer_ref(),
+            kind,
             name,
             preview,
             read_outbox_max_id,
             unread,
+            muted,
+            pinned,
+            // Nothing on the dialog row says so; `BlockedPeersLoaded` fills this in later.
+            blocked: false,
         }
     }
 }
@@ -78,18 +97,25 @@ fn read_state(raw: &tl::enums::Dialog, ticks: bool) -> (Option<i32>, usize) {
     }
 }
 
-/// Whether "the other side read this" is a statement worth making.
+/// Whether a mute deadline is still in force at `now`.
 ///
-/// A broadcast channel has readers, not a recipient — Telegram reports view counts there and never
-/// moves an outbox watermark worth believing. Saved Messages is you at both ends. grammers already
-/// splits broadcasts from megagroups, so supergroups keep their ticks, which is right: they do get
-/// `updateReadChannelOutbox`.
-fn receipts_make_sense(peer: &Peer) -> bool {
-    match peer {
-        Peer::Channel(_) => false,
-        Peer::User(user) => !user.is_self(),
-        Peer::Group(_) => true,
-    }
+/// Muting is a deadline, not a flag: `mute_until` is the unix second the chat becomes noisy again,
+/// and clients write a far-future one to mean "forever". `now` is passed in rather than read here
+/// so the boundary is testable — and this is shared with the live-update path in
+/// [`crate::telegram`], so the seed and the update can never disagree about what the field means.
+pub fn is_muted(mute_until: Option<i32>, now: i64) -> bool {
+    mute_until.is_some_and(|until| i64::from(until) > now)
+}
+
+/// Pin and mute as the dialog list reports them, as `(pinned, muted)`.
+///
+/// `dialogFolder` carries neither field, for the same reason it carries no read state.
+fn notify_state(raw: &tl::enums::Dialog, now: i64) -> (bool, bool) {
+    let tl::enums::Dialog::Dialog(raw) = raw else {
+        return (false, false);
+    };
+    let tl::enums::PeerNotifySettings::Settings(settings) = &raw.notify_settings;
+    (raw.pinned, is_muted(settings.mute_until, now))
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +130,14 @@ pub struct DialogListState {
 impl DialogListState {
     pub fn selected_peer(&self) -> Option<PeerRef> {
         self.items.get(self.selected).map(|item| item.peer)
+    }
+
+    pub fn selected_summary(&self) -> Option<&DialogSummary> {
+        self.items.get(self.selected)
+    }
+
+    pub fn find(&self, peer_id: PeerId) -> Option<&DialogSummary> {
+        self.items.iter().find(|item| item.peer.id == peer_id)
     }
 
     pub fn extend(&mut self, items: Vec<DialogSummary>, exhausted: bool) {
@@ -129,14 +163,88 @@ impl DialogListState {
 
     /// Move an existing dialog to the top and refresh its preview after a new message.
     pub fn bump(&mut self, peer_id: PeerId, preview: String) {
-        let Some(index) = self.items.iter().position(|item| item.peer.id == peer_id) else {
+        let Some(index) = self.index_of(peer_id) else {
             return;
         };
-        let mut item = self.items.remove(index);
-        item.preview = preview;
+        self.items[index].preview = preview;
+        self.move_to_top(index);
+    }
+
+    /// Blank a chat's preview line, because its history was just emptied.
+    pub fn clear_preview(&mut self, peer_id: PeerId) {
+        if let Some(item) = self.find_mut(peer_id) {
+            item.preview.clear();
+        }
+    }
+
+    /// Silence or unsilence a chat, after the server has confirmed it.
+    pub fn set_muted(&mut self, peer_id: PeerId, muted: bool) {
+        if let Some(item) = self.find_mut(peer_id) {
+            item.muted = muted;
+        }
+    }
+
+    /// Pin or unpin a chat.
+    ///
+    /// Pinning also moves the row to the top, which is where the server would put it on the next
+    /// `messages.getDialogs`. Unpinning leaves the row where it is rather than guessing which of
+    /// the chats below it now outranks it — the next start reads the true order back.
+    pub fn set_pinned(&mut self, peer_id: PeerId, pinned: bool) {
+        let Some(index) = self.index_of(peer_id) else {
+            return;
+        };
+        self.items[index].pinned = pinned;
+        if pinned {
+            self.move_to_top(index);
+        }
+    }
+
+    /// Record that a user is (or is no longer) on the account's blocked list.
+    pub fn set_blocked(&mut self, peer_id: PeerId, blocked: bool) {
+        if let Some(item) = self.find_mut(peer_id) {
+            item.blocked = blocked;
+        }
+    }
+
+    /// Seed blocked state from `contacts.getBlocked`, which answers for the whole account at once.
+    ///
+    /// Assigned rather than or-ed: this *is* the list, so a peer missing from it is not blocked.
+    pub fn set_blocked_list(&mut self, blocked: &[PeerId]) {
+        for item in &mut self.items {
+            item.blocked = blocked.contains(&item.peer.id);
+        }
+    }
+
+    /// Drop a conversation that is no longer in the list — left, deleted, or archived away.
+    ///
+    /// Returns whether a row actually went, because the caller has to close the chat pane if it
+    /// was the open one.
+    pub fn remove(&mut self, peer_id: PeerId) -> bool {
+        let Some(index) = self.index_of(peer_id) else {
+            return false;
+        };
+        self.items.remove(index);
+
+        // `selected` is a bare index, so a removal above it shifts the wrong row under the
+        // highlight, and removing the last row leaves it out of bounds entirely. Rows below the
+        // selection need no adjustment; the row *at* the selection hands the highlight to whatever
+        // moved up into its place.
+        if self.selected > index {
+            self.selected -= 1;
+        }
+        self.selected = self.selected.min(self.items.len().saturating_sub(1));
+        true
+    }
+
+    fn index_of(&self, peer_id: PeerId) -> Option<usize> {
+        self.items.iter().position(|item| item.peer.id == peer_id)
+    }
+
+    /// Move a row to the front, keeping the highlight on the conversation it was already on.
+    fn move_to_top(&mut self, index: usize) {
+        let item = self.items.remove(index);
         self.items.insert(0, item);
 
-        // Keep the highlighted row pointing at the same conversation it was on before the move.
         if self.selected == index {
             self.selected = 0;
         } else if self.selected < index {
@@ -194,7 +302,7 @@ impl DialogListState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{dialog, raw_dialog, raw_folder};
+    use crate::test_support::{dialog, raw_dialog, raw_dialog_with, raw_folder};
 
     fn list(count: i64) -> DialogListState {
         DialogListState {
@@ -373,6 +481,164 @@ mod tests {
         state.bump(peer, "newest".to_string());
 
         assert_eq!(state.items[0].unread, 3);
+    }
+
+    // -- mute, pin, block ----------------------------------------------------
+
+    /// A mute is a deadline, so "muted" depends on the clock, not just on the field being set.
+    #[test]
+    fn a_mute_deadline_in_the_past_is_not_a_mute() {
+        let now = 1_700_000_000;
+
+        let (_, muted) = notify_state(&raw_dialog_with(0, 0, false, Some(1_699_999_999)), now);
+        assert!(
+            !muted,
+            "the mute expired a second ago; the chat is noisy again"
+        );
+
+        let (_, muted) = notify_state(&raw_dialog_with(0, 0, false, Some(1_700_000_001)), now);
+        assert!(muted);
+
+        let (_, muted) = notify_state(&raw_dialog_with(0, 0, false, None), now);
+        assert!(!muted, "no deadline at all means the chat was never muted");
+    }
+
+    /// Clients write a far-future second to mean "forever", which must not overflow the compare.
+    #[test]
+    fn a_mute_forever_reads_as_muted_rather_than_wrapping() {
+        let (_, muted) = notify_state(
+            &raw_dialog_with(0, 0, false, Some(i32::MAX)),
+            i64::from(i32::MAX) - 1,
+        );
+        assert!(muted);
+    }
+
+    #[test]
+    fn the_pin_flag_is_carried_straight_off_the_dialog_row() {
+        assert!(notify_state(&raw_dialog_with(0, 0, true, None), 0).0);
+        assert!(!notify_state(&raw_dialog(0, 0), 0).0);
+    }
+
+    #[test]
+    fn an_archive_folder_row_carries_no_notify_state_either() {
+        assert_eq!(
+            notify_state(&raw_folder(), 0),
+            (false, false),
+            "`dialogFolder` has neither field, so this must stay a match rather than a field access"
+        );
+    }
+
+    #[test]
+    fn pinning_lifts_the_chat_to_where_the_server_would_put_it() {
+        let mut state = list(3);
+        let peer = state.items[2].peer.id;
+
+        state.set_pinned(peer, true);
+
+        assert_eq!(state.items[0].name, "chat 3");
+        assert!(state.items[0].pinned);
+    }
+
+    #[test]
+    fn unpinning_marks_the_chat_without_guessing_a_new_position() {
+        let mut state = list(3);
+        let peer = state.items[0].peer.id;
+        state.set_pinned(peer, true);
+
+        state.set_pinned(peer, false);
+
+        assert!(!state.items[0].pinned);
+        assert_eq!(
+            state.items[0].name, "chat 1",
+            "there is no way to know which chat now outranks it, and the next start reads the \
+             true order back anyway"
+        );
+    }
+
+    #[test]
+    fn the_blocked_list_is_the_whole_truth_and_clears_peers_missing_from_it() {
+        let mut state = list(3);
+        let first = state.items[0].peer.id;
+        let second = state.items[1].peer.id;
+        state.set_blocked(first, true);
+        state.set_blocked(second, true);
+
+        state.set_blocked_list(&[second]);
+
+        assert!(
+            !state.items[0].blocked && state.items[1].blocked,
+            "`contacts.getBlocked` answers for the whole account, so a peer it omits is not blocked"
+        );
+    }
+
+    // -- removal -------------------------------------------------------------
+
+    #[test]
+    fn removing_a_row_above_the_selection_keeps_the_same_chat_highlighted() {
+        let mut state = list(5);
+        state.selected = 3;
+        let expected = state.items[3].name.clone();
+
+        state.remove(state.items[1].peer.id);
+
+        assert_eq!(state.items[state.selected].name, expected);
+    }
+
+    #[test]
+    fn removing_a_row_below_the_selection_leaves_the_index_alone() {
+        let mut state = list(5);
+        state.selected = 1;
+
+        state.remove(state.items[4].peer.id);
+
+        assert_eq!(state.items[state.selected].name, "chat 2");
+    }
+
+    #[test]
+    fn removing_the_selected_row_hands_the_highlight_to_the_one_below() {
+        let mut state = list(5);
+        state.selected = 2;
+
+        state.remove(state.items[2].peer.id);
+
+        assert_eq!(
+            state.items[state.selected].name, "chat 4",
+            "the row that moved up into the vacated slot is the natural next selection"
+        );
+    }
+
+    /// The one case that would panic on the next render: `selected` is a bare index, and ratatui
+    /// is handed it verbatim.
+    #[test]
+    fn removing_the_last_row_pulls_the_selection_back_into_bounds() {
+        let mut state = list(3);
+        state.selected = 2;
+
+        state.remove(state.items[2].peer.id);
+
+        assert_eq!(state.selected, 1);
+        assert!(state.items.get(state.selected).is_some());
+    }
+
+    #[test]
+    fn removing_the_only_row_leaves_an_empty_list_with_a_selection_of_zero() {
+        let mut state = list(1);
+
+        assert!(state.remove(state.items[0].peer.id));
+
+        assert!(state.items.is_empty());
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn removing_a_chat_that_is_not_in_the_list_reports_that_nothing_went() {
+        let mut state = list(2);
+
+        assert!(
+            !state.remove(dialog(99, "stranger").peer.id),
+            "the caller closes the open chat on a `true`, so a miss must not claim a removal"
+        );
+        assert_eq!(state.items.len(), 2);
     }
 
     #[test]

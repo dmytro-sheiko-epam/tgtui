@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-cargo test                                  # whole suite (101 tests, all unit tests inside src/)
+cargo test                                  # whole suite (186 tests, all unit tests inside src/)
 cargo test scrolling_near_the_top           # one test by substring of its name
 cargo test app::tests                       # one module's tests
 cargo clippy --all-targets
@@ -108,6 +108,24 @@ from `App`.
   `DialogListState::reconcile_unread` takes the `min` of the server's `still_unread_count` rather
   than assigning it: the server counts from a read pointer tgtui never moves, so its number can
   only be believed when it is the smaller one. Assigning would resurrect a badge the user cleared.
+- **Chat actions are never applied optimistically.** `App` sends the `TgCommand` and waits for the
+  event; `run_action` changes nothing in `DialogListState` itself. This is the one part of the app
+  whose state is shared with the user's other devices, so a mute that silently failed but showed as
+  muted would be a lie about the account. It also means the same reducers serve a change made here
+  and one made on a phone — `settings_event` translates `updateNotifySettings`, `updatePeerBlocked`
+  and `updateDialogPinned` into exactly the events the menu produces.
+- **A mute is a deadline, not a flag.** `mute_until` is the second a chat becomes noisy again;
+  clients write a far-future one to mean "forever". `dialog_list::is_muted` is shared by the dialog
+  seed and the live update so the two can never disagree about what the field means.
+- **Removing a row must not strand the selection.** `DialogListState.selected` is a bare index
+  handed straight to ratatui, so `remove` clamps it, and `App::forget_dialog` follows it with the
+  chat pane and clears the compose box — a half-typed line must not be carried into whichever
+  conversation replaces the one that went.
+- **The menu is modal, and the viewer outranks it.** While `App.menu` is set `handle_main_key`
+  routes everything to `handle_menu_key`, or `j`/`k`/`y`/`n` would fall through into the compose box
+  behind the popup. `Ctrl+A` is checked after the viewer, because with a picture open the chat list
+  is not drawn and a menu over it would act on something invisible. While a confirmation is
+  pending `Esc` means "no" rather than "close".
 - **The tick column is reserved, not conditional.** Outgoing bodies wrap `TICK_GUTTER` columns
   short whether or not the message has been read, so a receipt changing from ✓ to ✓✓ cannot change
   a message's line count and therefore cannot move `scroll` under the reader. Same discipline as
@@ -128,17 +146,37 @@ and, for a group's voice chat, `[video chat started]` / `[video chat ended · 12
 joining one from the terminal is out of scope. Every other service action (joined, pinned, title
 changed) still renders as a blank line — extending `call_label` is where that would change.
 
+Chat actions live behind `Ctrl+A` on the selected conversation: mute/unmute, pin/unpin, archive,
+clear history, block/unblock, and delete-or-leave. Unlike everything else in this app these change
+the account's real state, visible on every other device the user owns, so they are the only
+commands issued from an explicit menu choice rather than from navigation. Which entries a
+conversation offers is `state::dialog_actions::actions_for`, and the reasoning behind each omission
+is in the tests there — a broadcast channel has no copy of its history that is yours to clear, a
+megagroup's would be `channels.deleteHistory` (admin-only, and destructive for everyone), and there
+is nobody to block in a group. `client.mark_as_read` exists in grammers and is deliberately never
+called; see the read-state paragraph below.
+
+Archiving is one-way. `DialogIter` asks `messages.getDialogs` for folder 0, so an archived chat is
+not in the list to be brought back, and there is no archive view for it to live in — which is why
+that entry is labelled "Archive (hides the chat)" rather than presented as a toggle. Blocked state
+is the one flag not on the dialog row, so it is seeded from a single `contacts.getBlocked` at
+startup; past its first page a blocked user shows "Block", and blocking twice is harmless.
+Adding a member, changing a title, and anything else requiring admin rights are out of scope.
+
 Read state is display-only. Outgoing messages carry a `✓` (sent) or `✓✓` (read by the recipient)
 at the right edge of their last line, and each chat-list row shows its unread count. Ticks are
 suppressed in broadcast channels, which have readers rather than a recipient, and in Saved
-Messages, which is you at both ends — `state::dialog_list::receipts_make_sense` decides. Nothing is
+Messages, which is you at both ends — `state::dialog_actions::DialogKind::receipts_make_sense`
+decides. Nothing is
 ever acknowledged back to Telegram, so the badge counts from the last time *this* client opened
 the chat and reading elsewhere only ever lowers it. Marking a chat read from the terminal is
 deliberately out of scope; it would change the account's real state on every other device.
 
 Keys: `Ctrl+P` opens the newest picture on screen full screen — a modifier because every plain
 character goes into the compose box — then `←`/`→` step through the chat's pictures and `Esc`
-closes. Stepping clamps at either end rather than wrapping.
+closes. Stepping clamps at either end rather than wrapping. `Ctrl+A`, a modifier for the same
+reason, opens the action menu on the selected chat: `↑`/`↓` and `Enter` pick, `Esc` closes, and the
+entries that cannot be undone from that screen ask `y`/`n` first.
 
 Pictures live in memory only and are never written to disk — the data directory is locked down
 for the session key, and chat photos have no business outliving the process. `state::media`

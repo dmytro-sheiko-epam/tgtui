@@ -8,14 +8,16 @@ pub mod commands;
 pub mod events;
 pub mod session;
 
+use std::future::Future;
 use std::sync::Arc;
 
+use chrono::Utc;
 use color_eyre::eyre::{Result, eyre};
 use grammers_client::client::{DialogIter, LoginToken, PasswordToken, UpdatesConfiguration};
 use grammers_client::tl;
 use grammers_client::update::Update;
-use grammers_client::{Client, SenderPool, SignInError};
-use grammers_session::types::PeerId;
+use grammers_client::{Client, InvocationError, SenderPool, SignInError};
+use grammers_session::types::{PeerId, PeerKind, PeerRef};
 use grammers_session::updates::UpdatesLike;
 use image::DynamicImage;
 use tokio::sync::{Mutex, mpsc};
@@ -27,6 +29,13 @@ use crate::config::Config;
 use crate::state::chat_buffer::{self, ChatMessage};
 use crate::state::dialog_list::{self, DialogSummary};
 use crate::state::media::{self, PhotoSource};
+
+/// The archive. Folder 0 is the main list; there are no other folders in the API.
+const ARCHIVE_FOLDER: i32 = 1;
+
+/// How much of the blocked list to read. Blocked lists are almost always far shorter than this,
+/// and the cost of being wrong past it is one menu entry reading "Block" instead of "Unblock".
+const BLOCKED_PAGE_SIZE: i32 = 100;
 
 /// Channel endpoints the UI uses to drive the actor.
 pub struct Telegram {
@@ -108,6 +117,14 @@ async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCo
                 source,
             } => actor.download_photo(peer, message_id, source),
             TgCommand::SendMessage { peer, text } => actor.send_message(peer, text),
+
+            TgCommand::SetMuted { peer, muted } => actor.set_muted(peer, muted),
+            TgCommand::SetPinned { peer, pinned } => actor.set_pinned(peer, pinned),
+            TgCommand::Archive { peer } => actor.archive(peer),
+            TgCommand::ClearHistory { peer } => actor.clear_history(peer),
+            TgCommand::DeleteDialog { peer } => actor.delete_dialog(peer),
+            TgCommand::SetBlocked { peer, blocked } => actor.set_blocked(peer, blocked),
+            TgCommand::LoadBlockedPeers => actor.load_blocked_peers(),
 
             TgCommand::Shutdown => {
                 actor.client.disconnect();
@@ -331,6 +348,216 @@ impl Actor {
             }
         });
     }
+
+    // -- chat actions --------------------------------------------------------
+
+    /// Run one chat action, reporting either the confirmed outcome or a banner-worthy failure.
+    ///
+    /// All of them share this shape, and none applies anything locally on its own — `App` waits
+    /// for the event. A failure has to be loud: the menu has closed by the time the answer comes
+    /// back, so an unreported one would leave the list looking simply unchanged.
+    fn act<F, Fut>(&self, what: String, success: TgEvent, call: F)
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), InvocationError>> + Send + 'static,
+    {
+        let client = self.client.clone();
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            match call(client).await {
+                Ok(()) => {
+                    let _ = events.send(success);
+                }
+                Err(err) => {
+                    let _ = events.send(TgEvent::Error(format!("could not {what}: {err}")));
+                }
+            }
+        });
+    }
+
+    fn set_muted(&mut self, peer: PeerRef, muted: bool) {
+        // A mute is a deadline rather than a flag: the second the chat becomes noisy again. A
+        // far-future one means "forever", which is the only mute this menu offers, and zero clears
+        // it — Telegram has no separate unmute call.
+        let request = tl::functions::account::UpdateNotifySettings {
+            peer: tl::types::InputNotifyPeer { peer: peer.into() }.into(),
+            settings: tl::types::InputPeerNotifySettings {
+                show_previews: None,
+                silent: None,
+                mute_until: Some(if muted { i32::MAX } else { 0 }),
+                sound: None,
+                stories_muted: None,
+                stories_hide_sender: None,
+                stories_sound: None,
+            }
+            .into(),
+        };
+
+        self.act(
+            format!("{} this chat", if muted { "mute" } else { "unmute" }),
+            TgEvent::MuteChanged {
+                peer: peer.id,
+                muted,
+            },
+            move |client| async move { client.invoke(&request).await.map(drop) },
+        );
+    }
+
+    fn set_pinned(&mut self, peer: PeerRef, pinned: bool) {
+        let request = tl::functions::messages::ToggleDialogPin {
+            pinned,
+            peer: tl::types::InputDialogPeer { peer: peer.into() }.into(),
+        };
+
+        self.act(
+            format!("{} this chat", if pinned { "pin" } else { "unpin" }),
+            TgEvent::PinChanged {
+                peer: peer.id,
+                pinned,
+            },
+            move |client| async move { client.invoke(&request).await.map(drop) },
+        );
+    }
+
+    /// Move a chat into the archive, which is folder 1. There is no dedicated archive call —
+    /// folders are the mechanism, and folder 0 is the main list.
+    fn archive(&mut self, peer: PeerRef) {
+        let request = tl::functions::folders::EditPeerFolders {
+            folder_peers: vec![
+                tl::types::InputFolderPeer {
+                    peer: peer.into(),
+                    folder_id: ARCHIVE_FOLDER,
+                }
+                .into(),
+            ],
+        };
+
+        self.act(
+            "archive this chat".to_string(),
+            TgEvent::DialogGone {
+                peer: peer.id,
+                reason: "archived",
+            },
+            move |client| async move { client.invoke(&request).await.map(drop) },
+        );
+    }
+
+    fn clear_history(&mut self, peer: PeerRef) {
+        // `just_clear` keeps the conversation in the list rather than deleting it, and `revoke`
+        // stays false so this empties our copy and leaves the other side's alone. The menu only
+        // offers this for peers `messages.deleteHistory` accepts — see `actions_for`.
+        let request = tl::functions::messages::DeleteHistory {
+            just_clear: true,
+            revoke: false,
+            peer: peer.into(),
+            max_id: 0,
+            min_date: None,
+            max_date: None,
+        };
+
+        self.act(
+            "clear this history".to_string(),
+            TgEvent::HistoryCleared { peer: peer.id },
+            move |client| async move { client.invoke(&request).await.map(drop) },
+        );
+    }
+
+    /// Delete a private chat, or leave a group or channel: grammers dispatches on peer kind.
+    fn delete_dialog(&mut self, peer: PeerRef) {
+        let leaving = peer.id.kind() != PeerKind::User;
+        self.act(
+            if leaving {
+                "leave this chat"
+            } else {
+                "delete this chat"
+            }
+            .to_string(),
+            TgEvent::DialogGone {
+                peer: peer.id,
+                reason: if leaving { "left" } else { "deleted" },
+            },
+            move |client| async move { client.delete_dialog(peer).await },
+        );
+    }
+
+    fn set_blocked(&mut self, peer: PeerRef, blocked: bool) {
+        self.act(
+            format!("{} this user", if blocked { "block" } else { "unblock" }),
+            TgEvent::BlockedChanged {
+                peer: peer.id,
+                blocked,
+            },
+            move |client| async move {
+                // Two calls rather than one with a flag, so the branch is here rather than in a
+                // request builder that would have to be generic over them.
+                if blocked {
+                    client
+                        .invoke(&tl::functions::contacts::Block {
+                            my_stories_from: false,
+                            id: peer.into(),
+                        })
+                        .await
+                        .map(drop)
+                } else {
+                    client
+                        .invoke(&tl::functions::contacts::Unblock {
+                            my_stories_from: false,
+                            id: peer.into(),
+                        })
+                        .await
+                        .map(drop)
+                }
+            },
+        );
+    }
+
+    /// Read the account's blocked list, so Block/Unblock can show the right face.
+    ///
+    /// Nothing on a dialog row says whether a user is blocked, and asking per chat would be a
+    /// request per row; this answers for the whole account at once. Only the first page is read —
+    /// past it a blocked user shows "Block", and blocking twice is harmless.
+    fn load_blocked_peers(&mut self) {
+        let client = self.client.clone();
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            let request = tl::functions::contacts::GetBlocked {
+                my_stories_from: false,
+                offset: 0,
+                limit: BLOCKED_PAGE_SIZE,
+            };
+
+            let blocked = match client.invoke(&request).await {
+                Ok(tl::enums::contacts::Blocked::Blocked(list)) => list.blocked,
+                Ok(tl::enums::contacts::Blocked::Slice(list)) => {
+                    if list.count > BLOCKED_PAGE_SIZE {
+                        tracing::debug!(
+                            total = list.count,
+                            read = BLOCKED_PAGE_SIZE,
+                            "blocked list truncated; the rest will offer Block rather than Unblock"
+                        );
+                    }
+                    list.blocked
+                }
+                Err(err) => {
+                    // No banner. The list is an optimisation for one menu entry's label, and a
+                    // failure here says nothing the user asked to know.
+                    tracing::debug!(%err, "could not read the blocked list");
+                    return;
+                }
+            };
+
+            let peers = blocked
+                .into_iter()
+                .map(|entry| match entry {
+                    tl::enums::PeerBlocked::Blocked(entry) => PeerId::from(&entry.peer_id),
+                })
+                .collect();
+
+            let _ = events.send(TgEvent::BlockedPeersLoaded { peers });
+        });
+    }
 }
 
 /// Fetch one page of history, newest first. `before_id` pages backwards through the chat.
@@ -417,10 +644,10 @@ async fn stream_updates(
                 });
                 continue;
             }
-            // Read state never arrives wrapped: grammers builds friendly variants for messages and
-            // bot queries only, so these come through raw.
+            // Read state and chat settings never arrive wrapped: grammers builds friendly variants
+            // for messages and bot queries only, so these come through raw.
             Update::Raw(raw) => {
-                if let Some(event) = read_event(&raw.raw) {
+                if let Some(event) = read_event(&raw.raw).or_else(|| settings_event(&raw.raw)) {
                     let _ = events.send(event);
                 }
                 continue;
@@ -471,5 +698,44 @@ fn read_event(update: &tl::enums::Update) -> Option<TgEvent> {
     // Read state is the one thing on screen that nothing local ever causes, so when a tick looks
     // wrong the log is the only way to tell "Telegram never said so" from "we decoded it wrong".
     tracing::debug!(?event, "read state");
+    Some(event)
+}
+
+/// Translate the updates that change a conversation's settings rather than its messages.
+///
+/// These are what makes muting from a phone show up here. The account-wide forms of
+/// `updateNotifySettings` — `notifyUsers`, `notifyChats`, `notifyBroadcasts`, `notifyForumTopic` —
+/// are dropped: they name no chat, and tgtui has no global notification setting for them to land
+/// on. Same reasoning as `updateReadChannelDiscussionOutbox` in `read_event`.
+fn settings_event(update: &tl::enums::Update) -> Option<TgEvent> {
+    use tl::enums::Update as U;
+    let event = match update {
+        U::NotifySettings(update) => {
+            let tl::enums::NotifyPeer::Peer(notify) = &update.peer else {
+                return None;
+            };
+            let tl::enums::PeerNotifySettings::Settings(settings) = &update.notify_settings;
+            TgEvent::MuteChanged {
+                peer: PeerId::from(&notify.peer),
+                muted: dialog_list::is_muted(settings.mute_until, Utc::now().timestamp()),
+            }
+        }
+        U::PeerBlocked(update) => TgEvent::BlockedChanged {
+            peer: PeerId::from(&update.peer_id),
+            blocked: update.blocked,
+        },
+        U::DialogPinned(update) => {
+            // `dialogPeerFolder` pins the archive row itself, which is not a conversation.
+            let tl::enums::DialogPeer::Peer(dialog) = &update.peer else {
+                return None;
+            };
+            TgEvent::PinChanged {
+                peer: PeerId::from(&dialog.peer),
+                pinned: update.pinned,
+            }
+        }
+        _ => return None,
+    };
+    tracing::debug!(?event, "chat settings");
     Some(event)
 }
