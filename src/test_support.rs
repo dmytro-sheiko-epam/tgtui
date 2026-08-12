@@ -13,6 +13,7 @@ use crate::app::App;
 use crate::state::chat_buffer::ChatMessage;
 use crate::state::dialog_actions::DialogKind;
 use crate::state::dialog_list::DialogSummary;
+use crate::state::folders::{Folder, FolderRule};
 use crate::state::media::{PhotoState, photo_ref};
 use crate::telegram::TgCommand;
 
@@ -201,6 +202,29 @@ pub fn dialog(id: i64, name: &str) -> DialogSummary {
         muted: false,
         pinned: false,
         blocked: false,
+        archived: false,
+        contact: false,
+        bot: false,
+    }
+}
+
+/// The same chat, sitting in folder 1 rather than folder 0.
+pub fn archived_dialog(id: i64, name: &str) -> DialogSummary {
+    DialogSummary {
+        archived: true,
+        ..dialog(id, name)
+    }
+}
+
+/// A folder that gathers exactly the chats it names, which is the shape that makes a test about
+/// tabs be about tabs rather than about the rule engine.
+pub fn folder(title: &str, members: &[PeerId]) -> Folder {
+    Folder {
+        title: title.to_string(),
+        rule: FolderRule {
+            include: members.to_vec(),
+            ..FolderRule::default()
+        },
     }
 }
 
@@ -276,6 +300,172 @@ pub fn raw_dialog_with(
         draft: None,
         folder_id: None,
         ttl_period: None,
+    })
+}
+
+/// A user as the archive fetch receives it, undressed, with the flags the folder rules read.
+pub fn raw_user(id: i64, name: &str, contact: bool, bot: bool) -> tl::enums::User {
+    tl::enums::User::User(tl::types::User {
+        is_self: false,
+        contact,
+        mutual_contact: false,
+        deleted: false,
+        bot,
+        bot_chat_history: false,
+        bot_nochats: false,
+        verified: false,
+        restricted: false,
+        min: false,
+        bot_inline_geo: false,
+        support: false,
+        scam: false,
+        apply_min_photo: false,
+        fake: false,
+        bot_attach_menu: false,
+        premium: false,
+        attach_menu_enabled: false,
+        bot_can_edit: false,
+        close_friend: false,
+        stories_hidden: false,
+        stories_unavailable: false,
+        contact_require_premium: false,
+        bot_business: false,
+        bot_has_main_app: false,
+        bot_forum_view: false,
+        bot_forum_can_manage_topics: false,
+        bot_can_manage_bots: false,
+        bot_guestchat: false,
+        bot_guard: false,
+        id,
+        access_hash: Some(id),
+        first_name: Some(name.to_string()),
+        last_name: None,
+        username: None,
+        phone: None,
+        photo: None,
+        status: None,
+        bot_info_version: None,
+        restriction_reason: None,
+        bot_inline_placeholder: None,
+        lang_code: None,
+        emoji_status: None,
+        usernames: None,
+        stories_max_id: None,
+        color: None,
+        profile_color: None,
+        bot_active_users: None,
+        bot_verification_icon: None,
+        send_paid_messages_stars: None,
+    })
+}
+
+/// A channel or megagroup, the two the same row tells apart by one flag.
+pub fn raw_channel(id: i64, title: &str, megagroup: bool) -> tl::enums::Chat {
+    tl::enums::Chat::Channel(tl::types::Channel {
+        creator: false,
+        left: false,
+        broadcast: !megagroup,
+        verified: false,
+        megagroup,
+        restricted: false,
+        signatures: false,
+        min: false,
+        scam: false,
+        has_link: false,
+        has_geo: false,
+        slowmode_enabled: false,
+        call_active: false,
+        call_not_empty: false,
+        fake: false,
+        gigagroup: false,
+        noforwards: false,
+        join_to_send: false,
+        join_request: false,
+        forum: false,
+        stories_hidden: false,
+        stories_hidden_min: false,
+        stories_unavailable: false,
+        signature_profiles: false,
+        autotranslation: false,
+        broadcast_messages_allowed: false,
+        monoforum: false,
+        forum_tabs: false,
+        id,
+        access_hash: Some(id),
+        title: title.to_string(),
+        username: None,
+        photo: tl::enums::ChatPhoto::Empty,
+        date: 0,
+        restriction_reason: None,
+        admin_rights: None,
+        banned_rights: None,
+        default_banned_rights: None,
+        participants_count: None,
+        usernames: None,
+        stories_max_id: None,
+        color: None,
+        profile_color: None,
+        emoji_status: None,
+        level: None,
+        subscription_until_date: None,
+        bot_verification_icon: None,
+        send_paid_messages_stars: None,
+        linked_monoforum_id: None,
+    })
+}
+
+/// The newest message in a chat, which is where an archived row's preview line comes from.
+pub fn raw_message(peer: tl::enums::Peer, id: i32, text: &str) -> tl::enums::Message {
+    tl::enums::Message::Message(tl::types::Message {
+        out: false,
+        mentioned: false,
+        media_unread: false,
+        silent: false,
+        post: false,
+        from_scheduled: false,
+        legacy: false,
+        edit_hide: false,
+        pinned: false,
+        noforwards: false,
+        invert_media: false,
+        offline: false,
+        video_processing_pending: false,
+        paid_suggested_post_stars: false,
+        paid_suggested_post_ton: false,
+        id,
+        from_id: None,
+        from_boosts_applied: None,
+        from_rank: None,
+        peer_id: peer,
+        saved_peer_id: None,
+        fwd_from: None,
+        via_bot_id: None,
+        via_business_bot_id: None,
+        guestchat_via_from: None,
+        reply_to: None,
+        date: 1_700_000_000,
+        message: text.to_string(),
+        media: None,
+        reply_markup: None,
+        entities: None,
+        views: None,
+        forwards: None,
+        replies: None,
+        edit_date: None,
+        post_author: None,
+        grouped_id: None,
+        reactions: None,
+        restriction_reason: None,
+        ttl_period: None,
+        quick_reply_shortcut_id: None,
+        effect: None,
+        factcheck: None,
+        report_delivery_until_date: None,
+        paid_message_stars: None,
+        suggested_post: None,
+        schedule_repeat_period: None,
+        summary_from_language: None,
+        rich_message: None,
     })
 }
 

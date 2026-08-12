@@ -71,7 +71,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             match app.focus {
                 Focus::Chats => {
-                    " ↑/↓ select · Enter open · Ctrl+A actions · Tab compose · Ctrl+C quit"
+                    " ↑/↓ select · Enter open · Ctrl+O/E folder · Ctrl+A actions · Tab compose · Ctrl+C quit"
                 }
                 Focus::Messages => {
                     " type to write · Enter send · ↑/↓ scroll · Ctrl+P picture · Ctrl+A actions · Tab/Esc back"
@@ -94,9 +94,10 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::state::chat_buffer::PAGE_SIZE;
+    use crate::state::dialog_list::FolderTab;
     use crate::telegram::TgEvent;
     use crate::test_support::{
-        app, channel_dialog, dialog, loaded_photo_message, message, page, peer,
+        app, channel_dialog, dialog, folder, loaded_photo_message, message, page, peer,
     };
 
     /// Render an app to a fixed-size test terminal and return the screen as text.
@@ -117,6 +118,7 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![dialog(1, "Alice"), dialog(2, "Bob")],
             exhausted: true,
+            archived: false,
         });
         app.handle_event(TgEvent::MessagesLoaded {
             peer: peer(1).id,
@@ -150,6 +152,69 @@ mod tests {
         assert!(
             screen.contains("message 100"),
             "newest message missing:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_strip_names_every_folder_and_the_pane_shows_the_one_it_is_on() {
+        let mut app = loaded_app();
+        app.handle_event(TgEvent::FoldersLoaded {
+            folders: vec![folder("Work", &[peer(2).id])],
+        });
+
+        let strip = screen(&mut app);
+        for tab in ["All", "Work", "Archive"] {
+            assert!(strip.contains(tab), "tab {tab} missing:\n{strip}");
+        }
+
+        // Through the key rather than the field, so the chat pane follows the new selection too —
+        // leaving it on a chat the list no longer offers would be the bug worth catching here.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.dialogs.tab, FolderTab::Custom(0));
+
+        let filtered = screen(&mut app);
+        assert!(
+            filtered.contains("Bob") && !filtered.contains("Alice"),
+            "the list must show the folder's members and only those:\n{filtered}"
+        );
+    }
+
+    /// A folder still filling as the main list pages in looks exactly like an account with no
+    /// chats, and "no chats" would be the wrong thing to conclude from it.
+    #[test]
+    fn an_empty_tab_says_which_kind_of_empty_it_is() {
+        let mut app = loaded_app();
+        app.handle_event(TgEvent::FoldersLoaded {
+            folders: vec![folder("Work", &[])],
+        });
+
+        app.dialogs.tab = FolderTab::Archive;
+        assert!(screen(&mut app).contains("no archived chats"));
+
+        app.dialogs.tab = FolderTab::Custom(0);
+        assert!(screen(&mut app).contains("nothing in this folder"));
+    }
+
+    /// A wide strip has to be windowed rather than truncated: the tab you are on is the one that
+    /// must stay legible, whatever else gets cut.
+    #[test]
+    fn a_strip_too_wide_for_the_pane_keeps_the_active_tab_on_screen() {
+        let mut app = loaded_app();
+        app.handle_event(TgEvent::FoldersLoaded {
+            folders: (1..=8)
+                .map(|n| folder(&format!("Folder {n}"), &[]))
+                .collect(),
+        });
+        app.dialogs.tab = FolderTab::Custom(7);
+
+        let screen = screen(&mut app);
+        assert!(screen.contains("Folder 8"), "{screen}");
+        assert!(
+            screen.contains('‹'),
+            "the strip must say that it has been cut:\n{screen}"
         );
     }
 
@@ -362,6 +427,7 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![channel_dialog(9, "Rust Blog")],
             exhausted: true,
+            archived: false,
         });
 
         let screen = with_menu(&mut app);
@@ -397,7 +463,8 @@ mod tests {
             "the footer must say how to answer:\n{screen}"
         );
         assert!(
-            !screen.contains("Archive"),
+            // A menu entry rather than "Archive", which is also the name of a folder tab.
+            !screen.contains("Pin to top"),
             "an unanswered question must not leave the menu behind it clickable:\n{screen}"
         );
     }

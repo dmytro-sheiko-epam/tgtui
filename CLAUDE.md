@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-cargo test                                  # whole suite (186 tests, all unit tests inside src/)
+cargo test                                  # whole suite (224 tests, all unit tests inside src/)
 cargo test scrolling_near_the_top           # one test by substring of its name
 cargo test app::tests                       # one module's tests
 cargo clippy --all-targets
@@ -118,9 +118,33 @@ from `App`.
   clients write a far-future one to mean "forever". `dialog_list::is_muted` is shared by the dialog
   seed and the live update so the two can never disagree about what the field means.
 - **Removing a row must not strand the selection.** `DialogListState.selected` is a bare index
-  handed straight to ratatui, so `remove` clamps it, and `App::forget_dialog` follows it with the
-  chat pane and clears the compose box — a half-typed line must not be carried into whichever
-  conversation replaces the one that went.
+  handed straight to ratatui, and it indexes the *visible* list rather than `items` — so nothing can
+  adjust it arithmetically. Every mutation that reorders, removes, refiles or refilters runs inside
+  `keeping_selection`, which anchors on the selected `PeerId` and falls back to the old position
+  when that conversation has left the view. `App::forget_dialog` then follows it with the chat pane
+  and clears the compose box — a half-typed line must not be carried into whichever conversation
+  replaces the one that went.
+- **One pool, two folders, N views.** `DialogListState.items` holds the main list and the archive
+  together, each row flagged `archived`, because a mute or an unread update names a chat and not a
+  folder; two lists would mean every reducer looking in both, and applying twice. What is on screen
+  is `visible()`, recomputed each frame — a cached membership would go stale the moment a mute
+  changed and a folder that excludes muted chats would lie about what it holds.
+- **Archiving moves a row; deleting removes one.** `TgEvent::FolderChanged` and
+  `App::refile_dialog` keep the `ChatBuffer` and leave the chat open, because the conversation still
+  exists — only its folder changed. `DialogGone` and `forget_dialog` are for delete and leave, which
+  really do end it. Collapsing the two, as an earlier version did, means re-fetching a whole
+  transcript to read it in the tab it moved to.
+- **An absent `folder_id` is not folder 0.** It means every folder, so the main dialog fetch carries
+  archived chats too and `is_archived` has to read the flag off each row. Assuming otherwise is what
+  put archived chats in the "All" tab. It also makes the two cursors overlap, so `extend` dedupes by
+  peer and lets the row already held win — except for `archived`, which the server has just restated
+  and which nothing else reports for a chat archived elsewhere while tgtui was not running.
+- **The archive cursor is hand-rolled, and skips two things `DialogIter` does.** Archived peers are
+  not written into the session's peer cache and channel `pts` is not recorded for them, so an
+  archived channel resolves an update gap less precisely. Neither affects reading or sending: the
+  `PeerRef` built by `DialogSummary::from_raw` carries the access hash off the response itself.
+  `messages.getDialogs` also has no continuation token — the next request restates the last row's
+  peer, top message id and that message's date, and all three must agree.
 - **The menu is modal, and the viewer outranks it.** While `App.menu` is set `handle_main_key`
   routes everything to `handle_menu_key`, or `j`/`k`/`y`/`n` would fall through into the compose box
   behind the popup. `Ctrl+A` is checked after the viewer, because with a picture open the chat list
@@ -146,8 +170,8 @@ and, for a group's voice chat, `[video chat started]` / `[video chat ended · 12
 joining one from the terminal is out of scope. Every other service action (joined, pinned, title
 changed) still renders as a blank line — extending `call_label` is where that would change.
 
-Chat actions live behind `Ctrl+A` on the selected conversation: mute/unmute, pin/unpin, archive,
-clear history, block/unblock, and delete-or-leave. Unlike everything else in this app these change
+Chat actions live behind `Ctrl+A` on the selected conversation: mute/unmute, pin/unpin,
+archive/unarchive, clear history, block/unblock, and delete-or-leave. Unlike everything else in this app these change
 the account's real state, visible on every other device the user owns, so they are the only
 commands issued from an explicit menu choice rather than from navigation. Which entries a
 conversation offers is `state::dialog_actions::actions_for`, and the reasoning behind each omission
@@ -156,12 +180,27 @@ megagroup's would be `channels.deleteHistory` (admin-only, and destructive for e
 is nobody to block in a group. `client.mark_as_read` exists in grammers and is deliberately never
 called; see the read-state paragraph below.
 
-Archiving is one-way. `DialogIter` asks `messages.getDialogs` for folder 0, so an archived chat is
-not in the list to be brought back, and there is no archive view for it to live in — which is why
-that entry is labelled "Archive (hides the chat)" rather than presented as a toggle. Blocked state
-is the one flag not on the dialog row, so it is seeded from a single `contacts.getBlocked` at
-startup; past its first page a blocked user shows "Block", and blocking twice is harmless.
-Adding a member, changing a title, and anything else requiring admin rights are out of scope.
+The chat list is a strip of folder tabs over one pool of dialogs: `All`, the account's own folders,
+then `Archive`. `Ctrl+O` and `Ctrl+E` step through them, wrapping.
+
+Only two of those tabs are server folders, and neither fetch maps onto one cleanly. `DialogIter`
+sends `messages.getDialogs` with the `folder_id` flag *absent*, which does not mean folder 0 — it
+means every folder, so the main fetch delivers archived chats mixed in and only each row's own
+`folder_id` says which is which (`dialog_list::is_archived`). The archive is folder 1 and is *also*
+paged on its own, by hand, through a raw `messages.getDialogs` (`Actor::load_more_archived`),
+because `DialogIter`'s request is private and cannot be re-pointed — the main list pages in recency
+order, so without a dedicated cursor an old archived chat would only surface after paging the whole
+account. The two therefore overlap, which is why `DialogListState::extend` dedupes by peer. The account's *own* folders are not collections at all —
+`messages.getDialogFilters` returns rules, and every client evaluates them over the dialog list it
+already has. `state::folders::matches` is that evaluation, and it is why a custom tab keeps pulling
+pages of the main list until it has rows to show: the server will not answer "the chats in Work".
+
+Archiving is therefore a toggle, not a trapdoor. Both directions are one
+`folders.editPeerFolders` with a different folder id, and the row moves between tabs rather than
+leaving the pool. Blocked state is the one flag not on the dialog row, so it is seeded from a single
+`contacts.getBlocked` at startup; past its first page a blocked user shows "Block", and blocking
+twice is harmless. Adding a member, changing a title, editing the folders themselves, and anything
+else requiring admin rights are out of scope.
 
 Read state is display-only. Outgoing messages carry a `✓` (sent) or `✓✓` (read by the recipient)
 at the right edge of their last line, and each chat-list row shows its unread count. Ticks are
@@ -176,7 +215,9 @@ Keys: `Ctrl+P` opens the newest picture on screen full screen — a modifier bec
 character goes into the compose box — then `←`/`→` step through the chat's pictures and `Esc`
 closes. Stepping clamps at either end rather than wrapping. `Ctrl+A`, a modifier for the same
 reason, opens the action menu on the selected chat: `↑`/`↓` and `Enter` pick, `Esc` closes, and the
-entries that cannot be undone from that screen ask `y`/`n` first.
+entries that cannot be undone from that screen ask `y`/`n` first. `Ctrl+O` and `Ctrl+E` step
+forwards and backwards through the folder tabs; unlike the viewer's `←`/`→` they wrap, because the
+strip is a ring whose ends are both on screen.
 
 Pictures live in memory only and are never written to disk — the data directory is locked down
 for the session key, and chat photos have no business outliving the process. `state::media`

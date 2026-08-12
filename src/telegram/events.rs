@@ -7,6 +7,7 @@ use image::DynamicImage;
 
 use crate::state::chat_buffer::ChatMessage;
 use crate::state::dialog_list::DialogSummary;
+use crate::state::folders::Folder;
 
 #[derive(Debug)]
 pub enum TgEvent {
@@ -26,6 +27,17 @@ pub enum TgEvent {
     DialogsLoaded {
         items: Vec<DialogSummary>,
         exhausted: bool,
+        /// Which folder's cursor this page advanced.
+        archived: bool,
+    },
+    /// The account's own chat folders, as one answer for the whole tab strip.
+    FoldersLoaded {
+        folders: Vec<Folder>,
+    },
+    /// A chat moved between the main list and the archive — here or on another device.
+    FolderChanged {
+        peer: PeerId,
+        archived: bool,
     },
     /// The first (newest) page of a chat's history.
     MessagesLoaded {
@@ -109,8 +121,8 @@ pub enum TgEvent {
     HistoryCleared {
         peer: PeerId,
     },
-    /// The conversation is no longer in the main list — deleted, left, or archived. The app treats
-    /// all three the same way, because from the list's point of view they are the same thing.
+    /// The conversation is gone for good — deleted or left. Archiving is *not* this: it moves the
+    /// row to another tab and reports `FolderChanged`.
     DialogGone {
         peer: PeerId,
         /// What to tell the user, since the three reasons read very differently.

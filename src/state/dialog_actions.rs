@@ -1,7 +1,7 @@
 //! What a conversation can have done to it, and which of those a given conversation offers.
 //!
 //! Kept apart from [`crate::state::dialog_list`] and from `App` because it is the one part of the
-//! feature with no state at all: given a kind and three flags it answers with a menu. That makes
+//! feature with no state at all: given a kind and four flags it answers with a menu. That makes
 //! the table below — which is the thing a reader actually wants to check — testable on its own.
 
 use grammers_client::peer::Peer;
@@ -57,9 +57,9 @@ pub enum DialogAction {
     Unmute,
     Pin,
     Unpin,
-    /// One-way from here: `iter_dialogs` asks for folder 0 only, so an archived chat is not in the
-    /// list to be unarchived. See `CLAUDE.md`.
+    /// Move to (or back from) the archive, which the tab strip shows as a folder of its own.
     Archive,
+    Unarchive,
     ClearHistory,
     Block,
     Unblock,
@@ -76,8 +76,8 @@ impl DialogAction {
             DialogAction::Unmute => "Unmute",
             DialogAction::Pin => "Pin to top",
             DialogAction::Unpin => "Unpin",
-            // The parenthetical is not decoration: there is no archive view to bring it back from.
-            DialogAction::Archive => "Archive (hides the chat)",
+            DialogAction::Archive => "Archive",
+            DialogAction::Unarchive => "Unarchive",
             DialogAction::ClearHistory => "Clear history",
             DialogAction::Block => "Block user",
             DialogAction::Unblock => "Unblock user",
@@ -102,9 +102,6 @@ impl DialogAction {
     }
 
     /// What the status banner says while the request is in flight.
-    ///
-    /// Not the label: "Archive (hides the chat)…" would be a strange thing to watch happen, and
-    /// the parenthetical has already done its job by the time the user picks it.
     pub fn in_progress(self) -> &'static str {
         match self {
             DialogAction::Mute => "muting…",
@@ -112,6 +109,7 @@ impl DialogAction {
             DialogAction::Pin => "pinning…",
             DialogAction::Unpin => "unpinning…",
             DialogAction::Archive => "archiving…",
+            DialogAction::Unarchive => "unarchiving…",
             DialogAction::ClearHistory => "clearing history…",
             DialogAction::Block => "blocking…",
             DialogAction::Unblock => "unblocking…",
@@ -146,6 +144,7 @@ pub fn actions_for(
     muted: bool,
     pinned: bool,
     blocked: bool,
+    archived: bool,
 ) -> Vec<DialogAction> {
     let mut actions = vec![
         if muted {
@@ -158,7 +157,11 @@ pub fn actions_for(
         } else {
             DialogAction::Pin
         },
-        DialogAction::Archive,
+        if archived {
+            DialogAction::Unarchive
+        } else {
+            DialogAction::Archive
+        },
     ];
 
     // A broadcast channel's history is the channel's, not yours, and there is no copy of your own
@@ -191,7 +194,7 @@ mod tests {
     use super::*;
 
     fn labels(kind: DialogKind, muted: bool, pinned: bool, blocked: bool) -> Vec<&'static str> {
-        actions_for(kind, muted, pinned, blocked)
+        actions_for(kind, muted, pinned, blocked, false)
             .into_iter()
             .map(|action| action.label(kind))
             .collect()
@@ -209,7 +212,7 @@ mod tests {
             [
                 "Mute",
                 "Pin to top",
-                "Archive (hides the chat)",
+                "Archive",
                 "Clear history",
                 "Block user",
                 "Delete chat",
@@ -224,7 +227,7 @@ mod tests {
             [
                 "Mute",
                 "Pin to top",
-                "Archive (hides the chat)",
+                "Archive",
                 "Clear history",
                 "Leave group",
             ],
@@ -239,12 +242,7 @@ mod tests {
     fn a_megagroup_is_left_like_a_group_but_offers_no_clear_history() {
         assert_eq!(
             labels(MEGAGROUP, false, false, false),
-            [
-                "Mute",
-                "Pin to top",
-                "Archive (hides the chat)",
-                "Leave group",
-            ]
+            ["Mute", "Pin to top", "Archive", "Leave group",]
         );
     }
 
@@ -252,12 +250,7 @@ mod tests {
     fn a_channel_is_left_and_has_no_history_of_yours_to_clear() {
         assert_eq!(
             labels(DialogKind::Channel, false, false, false),
-            [
-                "Mute",
-                "Pin to top",
-                "Archive (hides the chat)",
-                "Leave channel",
-            ],
+            ["Mute", "Pin to top", "Archive", "Leave channel",],
             "the history in a broadcast channel belongs to the channel; there is no copy of it \
              that clearing could empty"
         );
@@ -285,7 +278,7 @@ mod tests {
     #[test]
     fn a_toggle_never_offers_both_of_its_faces_at_once() {
         for (muted, pinned, blocked) in [(false, false, false), (true, true, true)] {
-            let menu = actions_for(PERSON, muted, pinned, blocked);
+            let menu = actions_for(PERSON, muted, pinned, blocked, false);
             let mut seen = menu.clone();
             seen.dedup();
             assert_eq!(seen.len(), menu.len(), "duplicate entry in {menu:?}");
@@ -320,15 +313,19 @@ mod tests {
         }
     }
 
-    /// Archiving is not reversible from this UI — there is no archive view — so despite being
-    /// harmless on the server it is the one non-undoable action that is *not* gated. Pinned here
-    /// so the decision is deliberate rather than an oversight.
+    /// Archiving used to be the one action with no way back, and its label said so. Now that the
+    /// tab strip has an Archive folder it is a toggle like the others, and gating it would be in
+    /// the way of a keystroke the very next menu undoes.
     #[test]
-    fn archiving_is_not_gated_but_says_what_it_does_in_its_label() {
+    fn archiving_is_a_toggle_that_the_archive_tab_can_undo() {
         assert!(!DialogAction::Archive.is_destructive());
+        assert!(!DialogAction::Unarchive.is_destructive());
+
+        let filed = actions_for(PERSON, false, false, false, true);
+        assert!(filed.contains(&DialogAction::Unarchive));
         assert!(
-            DialogAction::Archive.label(PERSON).contains("hides"),
-            "with no confirmation and no way back, the label is the only warning there is"
+            !filed.contains(&DialogAction::Archive),
+            "a chat already in the archive has nowhere to be archived to"
         );
     }
 

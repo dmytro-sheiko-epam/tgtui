@@ -17,8 +17,14 @@ pub enum TgCommand {
     CheckPassword {
         password: String,
     },
-    /// Fetch the next page of dialogs for the chat list.
-    LoadMoreDialogs,
+    /// Fetch the next page of dialogs for the chat list, from folder 1 rather than folder 0 when
+    /// `archived`. The two folders page independently and have a cursor each.
+    LoadMoreDialogs {
+        archived: bool,
+    },
+    /// Read the account's own chat folders. They are filter rules rather than a collection, so
+    /// this answers once for the whole tab strip and nothing pages.
+    LoadFolders,
     /// Load the most recent page of messages for a chat that has not been opened yet.
     OpenChat {
         peer: PeerRef,
@@ -56,10 +62,11 @@ pub enum TgCommand {
         peer: PeerRef,
         pinned: bool,
     },
-    /// Move a chat into the archive folder. One-way: `iter_dialogs` only asks for folder 0, so an
-    /// archived chat is not in the list to be brought back.
-    Archive {
+    /// Move a chat into the archive folder, or back out of it. Both are the same call — folders
+    /// are the mechanism and folder 0 is the main list.
+    SetArchived {
         peer: PeerRef,
+        archived: bool,
     },
     /// Empty our copy of a chat's history, leaving the conversation in the list.
     ClearHistory {

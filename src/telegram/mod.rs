@@ -28,6 +28,7 @@ pub use events::TgEvent;
 use crate::config::Config;
 use crate::state::chat_buffer::{self, ChatMessage};
 use crate::state::dialog_list::{self, DialogSummary};
+use crate::state::folders::Folder;
 use crate::state::media::{self, PhotoSource};
 
 /// The archive. Folder 0 is the main list; there are no other folders in the API.
@@ -69,6 +70,7 @@ pub async fn spawn(config: &Config) -> Result<Telegram> {
             login_token: None,
             password_token: None,
             dialogs: Arc::new(Mutex::new(None)),
+            archive: Arc::new(Mutex::new(ArchiveCursor::default())),
             updates: Some(updates),
         },
         cmd_rx,
@@ -90,8 +92,24 @@ struct Actor {
     password_token: Option<PasswordToken>,
     /// One long-lived iterator, so each page picks up where the last left off.
     dialogs: Arc<Mutex<Option<DialogIter>>>,
+    /// The same for folder 1, by hand: `DialogIter` hardcodes `folder_id: None` and its request
+    /// is private, so the archive is paged through a raw `messages.getDialogs`.
+    archive: Arc<Mutex<ArchiveCursor>>,
     /// Taken when the update stream starts; `None` afterwards.
     updates: Option<mpsc::UnboundedReceiver<UpdatesLike>>,
+}
+
+/// Where the archive fetch got to.
+///
+/// `messages.getDialogs` pages by the *last row returned* rather than by an opaque token: the next
+/// request repeats that dialog's peer, its top message id, and that message's date. Holding the
+/// three together is the whole reason this is a struct.
+#[derive(Default)]
+struct ArchiveCursor {
+    offset_date: i32,
+    offset_id: i32,
+    offset_peer: Option<tl::enums::InputPeer>,
+    exhausted: bool,
 }
 
 async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCommand>) {
@@ -106,7 +124,9 @@ async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCo
 
             // Everything else is spawned so a slow request (or a flood-wait sleep) never
             // stalls the other commands queued behind it.
-            TgCommand::LoadMoreDialogs => actor.load_more_dialogs(),
+            TgCommand::LoadMoreDialogs { archived: false } => actor.load_more_dialogs(),
+            TgCommand::LoadMoreDialogs { archived: true } => actor.load_more_archived(),
+            TgCommand::LoadFolders => actor.load_folders(),
             TgCommand::OpenChat { peer } => actor.open_chat(peer),
             TgCommand::LoadOlderMessages { peer, before_id } => {
                 actor.load_older_messages(peer, before_id)
@@ -120,7 +140,7 @@ async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCo
 
             TgCommand::SetMuted { peer, muted } => actor.set_muted(peer, muted),
             TgCommand::SetPinned { peer, pinned } => actor.set_pinned(peer, pinned),
-            TgCommand::Archive { peer } => actor.archive(peer),
+            TgCommand::SetArchived { peer, archived } => actor.set_archived(peer, archived),
             TgCommand::ClearHistory { peer } => actor.clear_history(peer),
             TgCommand::DeleteDialog { peer } => actor.delete_dialog(peer),
             TgCommand::SetBlocked { peer, blocked } => actor.set_blocked(peer, blocked),
@@ -247,12 +267,132 @@ impl Actor {
             }
 
             let exhausted = items.len() < dialog_list::PAGE_SIZE;
-            let _ = events.send(TgEvent::DialogsLoaded { items, exhausted });
+            let _ = events.send(TgEvent::DialogsLoaded {
+                items,
+                exhausted,
+                archived: false,
+            });
 
             // Update gap resolution needs peers in the session cache, which the dialog fetch
             // above has just populated, so this is the first safe moment to start streaming.
             if let Some((client, events, updates)) = start_updates {
                 tokio::spawn(stream_updates(client, updates, events));
+            }
+        });
+    }
+
+    /// The archive, one page at a time.
+    ///
+    /// Hand-rolled because `iter_dialogs` cannot be pointed at a folder: grammers builds the
+    /// request with `folder_id: None` and keeps it private. Two things `DialogIter::next` would
+    /// have done are therefore skipped — archived peers are not written into the session's peer
+    /// cache, and channel `pts` is not recorded for them, so an archived channel resolves an
+    /// update gap less precisely. Neither affects reading or sending: the `PeerRef` built from the
+    /// response carries its own access hash.
+    fn load_more_archived(&mut self) {
+        let client = self.client.clone();
+        let archive = Arc::clone(&self.archive);
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            let mut cursor = archive.lock().await;
+            if cursor.exhausted {
+                // The guard in `App` has already been set; report an empty page so it clears.
+                let _ = events.send(TgEvent::DialogsLoaded {
+                    items: Vec::new(),
+                    exhausted: true,
+                    archived: true,
+                });
+                return;
+            }
+
+            let request = tl::functions::messages::GetDialogs {
+                exclude_pinned: false,
+                folder_id: Some(ARCHIVE_FOLDER),
+                offset_date: cursor.offset_date,
+                offset_id: cursor.offset_id,
+                offset_peer: cursor
+                    .offset_peer
+                    .clone()
+                    .unwrap_or(tl::enums::InputPeer::Empty),
+                limit: dialog_list::PAGE_SIZE as i32,
+                // Only meaningful for the pinned-dialog cache, which this does not keep.
+                hash: 0,
+            };
+
+            let (dialogs, messages, users, chats, exhausted) = match client.invoke(&request).await {
+                // The unsliced form is the whole folder: there is nothing after it.
+                Ok(tl::enums::messages::Dialogs::Dialogs(page)) => {
+                    (page.dialogs, page.messages, page.users, page.chats, true)
+                }
+                Ok(tl::enums::messages::Dialogs::Slice(page)) => {
+                    (page.dialogs, page.messages, page.users, page.chats, false)
+                }
+                // Answered only when a hash was sent, which this never does.
+                Ok(tl::enums::messages::Dialogs::NotModified(_)) => {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), true)
+                }
+                Err(err) => {
+                    let _ = events.send(TgEvent::Error(format!("loading archive: {err}")));
+                    // Report the empty page anyway, or the in-flight guard never clears and
+                    // scrolling back down would not retry.
+                    let _ = events.send(TgEvent::DialogsLoaded {
+                        items: Vec::new(),
+                        exhausted: false,
+                        archived: true,
+                    });
+                    return;
+                }
+            };
+
+            // Each row is kept next to the summary built from it: paging repeats the last one's
+            // peer and top message id, and that message's date, and only a row that resolved has
+            // a `PeerRef` to repeat.
+            let rows: Vec<(&tl::enums::Dialog, DialogSummary)> = dialogs
+                .iter()
+                .filter_map(|dialog| {
+                    DialogSummary::from_raw(dialog, &users, &chats, &messages)
+                        .map(|summary| (dialog, summary))
+                })
+                .collect();
+
+            match rows.last() {
+                Some((raw, summary)) => advance(&mut cursor, raw, summary, &messages),
+                // Rows came back but not one of them could be resolved to a peer, so there is no
+                // anchor for the next request. Stopping is the only way out: repeating the same
+                // offsets would fetch the same unusable page forever.
+                None if !dialogs.is_empty() => cursor.exhausted = true,
+                None => {}
+            }
+            cursor.exhausted |= exhausted || dialogs.is_empty();
+
+            let items: Vec<DialogSummary> = rows.into_iter().map(|(_, summary)| summary).collect();
+
+            let _ = events.send(TgEvent::DialogsLoaded {
+                items,
+                exhausted: cursor.exhausted,
+                archived: true,
+            });
+        });
+    }
+
+    /// Read the account's chat folders.
+    ///
+    /// One request for the whole strip: a folder is a rule, not a collection, so there is nothing
+    /// to page and nothing to fetch again until an update says the rules changed.
+    fn load_folders(&mut self) {
+        let client = self.client.clone();
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            match fetch_folders(&client).await {
+                Ok(folders) => {
+                    let _ = events.send(TgEvent::FoldersLoaded { folders });
+                }
+                // Not fatal: without folders the strip is still "All" and "Archive".
+                Err(err) => {
+                    let _ = events.send(TgEvent::Error(format!("loading folders: {err}")));
+                }
             }
         });
     }
@@ -420,24 +560,29 @@ impl Actor {
         );
     }
 
-    /// Move a chat into the archive, which is folder 1. There is no dedicated archive call —
-    /// folders are the mechanism, and folder 0 is the main list.
-    fn archive(&mut self, peer: PeerRef) {
+    /// Move a chat into the archive, which is folder 1, or back to the main list, which is folder
+    /// 0. There is no dedicated archive call — folders are the mechanism, and both directions are
+    /// the same request with a different number.
+    fn set_archived(&mut self, peer: PeerRef, archived: bool) {
         let request = tl::functions::folders::EditPeerFolders {
             folder_peers: vec![
                 tl::types::InputFolderPeer {
                     peer: peer.into(),
-                    folder_id: ARCHIVE_FOLDER,
+                    folder_id: if archived { ARCHIVE_FOLDER } else { 0 },
                 }
                 .into(),
             ],
         };
 
         self.act(
-            "archive this chat".to_string(),
-            TgEvent::DialogGone {
+            if archived {
+                "archive this chat".to_string()
+            } else {
+                "unarchive this chat".to_string()
+            },
+            TgEvent::FolderChanged {
                 peer: peer.id,
-                reason: "archived",
+                archived,
             },
             move |client| async move { client.invoke(&request).await.map(drop) },
         );
@@ -606,6 +751,52 @@ async fn fetch_image(client: &Client, source: &PhotoSource) -> Result<DynamicIma
         .map_err(Into::into)
 }
 
+/// Point the archive cursor just past the last row of a page.
+///
+/// `messages.getDialogs` has no opaque continuation token: the next request restates where the
+/// last one ended, and all three offsets have to agree or the server starts from somewhere else.
+/// The date is the *message's*, not the dialog's — a dialog row carries no date of its own.
+fn advance(
+    cursor: &mut ArchiveCursor,
+    raw: &tl::enums::Dialog,
+    summary: &DialogSummary,
+    messages: &[tl::enums::Message],
+) {
+    let tl::enums::Dialog::Dialog(dialog) = raw else {
+        return;
+    };
+
+    cursor.offset_id = dialog.top_message;
+    cursor.offset_peer = Some(summary.peer.into());
+    cursor.offset_date = messages
+        .iter()
+        .find_map(|message| match message {
+            tl::enums::Message::Message(message)
+                if message.id == dialog.top_message && message.peer_id == dialog.peer =>
+            {
+                Some(message.date)
+            }
+            tl::enums::Message::Service(message)
+                if message.id == dialog.top_message && message.peer_id == dialog.peer =>
+            {
+                Some(message.date)
+            }
+            _ => None,
+        })
+        // A chat whose newest message the server did not send back — an empty one, say. Zero
+        // means "no date offset", and the id and peer still pin the position.
+        .unwrap_or(0);
+}
+
+/// Read the account's chat folders and keep the ones that are folders of the user's own.
+async fn fetch_folders(client: &Client) -> Result<Vec<Folder>, InvocationError> {
+    let tl::enums::messages::DialogFilters::Filters(answer) = client
+        .invoke(&tl::functions::messages::GetDialogFilters {})
+        .await?;
+
+    Ok(answer.filters.iter().filter_map(Folder::from_raw).collect())
+}
+
 /// Forward live updates for as long as the connection lasts.
 async fn stream_updates(
     client: Client,
@@ -649,6 +840,22 @@ async fn stream_updates(
             Update::Raw(raw) => {
                 if let Some(event) = read_event(&raw.raw).or_else(|| settings_event(&raw.raw)) {
                     let _ = events.send(event);
+                    continue;
+                }
+                // One update can move several chats at once, so this one answers with a list.
+                for event in folder_events(&raw.raw) {
+                    let _ = events.send(event);
+                }
+                // The folders themselves changed shape. They are rules rather than a collection,
+                // so there is nothing to patch — the cheapest correct thing is to read them again.
+                if matches!(
+                    raw.raw,
+                    tl::enums::Update::DialogFilter(_)
+                        | tl::enums::Update::DialogFilterOrder(_)
+                        | tl::enums::Update::DialogFilters
+                ) && let Ok(folders) = fetch_folders(&client).await
+                {
+                    let _ = events.send(TgEvent::FoldersLoaded { folders });
                 }
                 continue;
             }
@@ -699,6 +906,33 @@ fn read_event(update: &tl::enums::Update) -> Option<TgEvent> {
     // wrong the log is the only way to tell "Telegram never said so" from "we decoded it wrong".
     tracing::debug!(?event, "read state");
     Some(event)
+}
+
+/// Translate a chat moving between folders, which is what archiving from another device looks
+/// like on the wire.
+///
+/// A list rather than an `Option`: `updateFolderPeers` carries however many chats moved together,
+/// and dropping all but the first would leave the rest in the wrong tab until the next start.
+/// Folders other than 0 and 1 do not exist — the archive is the only one the API has — so the
+/// number is read as a boolean.
+fn folder_events(update: &tl::enums::Update) -> Vec<TgEvent> {
+    let tl::enums::Update::FolderPeers(update) = update else {
+        return Vec::new();
+    };
+
+    update
+        .folder_peers
+        .iter()
+        .map(|peer| {
+            let tl::enums::FolderPeer::Peer(peer) = peer;
+            let event = TgEvent::FolderChanged {
+                peer: PeerId::from(&peer.peer),
+                archived: peer.folder_id == ARCHIVE_FOLDER,
+            };
+            tracing::debug!(?event, "folder change");
+            event
+        })
+        .collect()
 }
 
 /// Translate the updates that change a conversation's settings rather than its messages.

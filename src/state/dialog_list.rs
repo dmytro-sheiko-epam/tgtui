@@ -1,4 +1,10 @@
-//! The chat list: dialog summaries plus the cursor for lazily loading more of them.
+//! The chat list: dialog summaries, the folder tabs drawn over them, and the cursors that lazily
+//! load more of them.
+//!
+//! One pool, two server folders. `items` holds the main list and the archive together, each row
+//! carrying an `archived` flag, because a mute or an unread update names a chat and not a folder —
+//! with two separate lists every such reducer would have to look in both and could apply twice.
+//! What the user sees is a view over the pool: see [`FolderTab`] and [`DialogListState::visible`].
 
 use chrono::Utc;
 use grammers_client::peer::Dialog;
@@ -7,12 +13,16 @@ use grammers_session::types::{PeerId, PeerRef};
 
 use crate::state::call::call_label;
 use crate::state::dialog_actions::DialogKind;
+use crate::state::folders::{self, Folder};
 
 /// How many dialogs to pull per page.
 pub const PAGE_SIZE: usize = 30;
 
 /// Start loading more dialogs once the selection is this close to the end of the loaded list.
 const PREFETCH_MARGIN: usize = 5;
+
+/// The archive. Folder 0 is the main list; there are no other folders in the API.
+const ARCHIVE_FOLDER: i32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct DialogSummary {
@@ -37,6 +47,13 @@ pub struct DialogSummary {
     /// dialog row, so it stays `false` until `contacts.getBlocked` answers. Always `false` for a
     /// group or channel, which cannot be blocked.
     pub blocked: bool,
+    /// Which server folder this came from: folder 1, the archive, rather than folder 0.
+    pub archived: bool,
+    /// On the account's contact list, and a bot, respectively. Neither has anything to do with how
+    /// the row is drawn — they are here because [`crate::state::folders`] needs them to tell a
+    /// folder of contacts from one of bots, and a dialog row is the only place they arrive.
+    pub contact: bool,
+    pub bot: bool,
 }
 
 impl DialogSummary {
@@ -67,6 +84,10 @@ impl DialogSummary {
         let kind = DialogKind::of(dialog.peer());
         let (read_outbox_max_id, unread) = read_state(&dialog.raw, kind.receipts_make_sense());
         let (pinned, muted) = notify_state(&dialog.raw, Utc::now().timestamp());
+        let user = match dialog.peer() {
+            grammers_client::peer::Peer::User(user) => Some(user),
+            _ => None,
+        };
 
         Self {
             peer: dialog.peer_ref(),
@@ -79,7 +100,174 @@ impl DialogSummary {
             pinned,
             // Nothing on the dialog row says so; `BlockedPeersLoaded` fills this in later.
             blocked: false,
+            archived: is_archived(&dialog.raw),
+            contact: user.is_some_and(|user| user.contact()),
+            bot: user.is_some_and(|user| user.is_bot()),
         }
+    }
+
+    /// The same, for an archived chat, which arrives as undressed TL rather than as a
+    /// [`grammers_client::peer::Dialog`].
+    ///
+    /// The archive is fetched by hand — `DialogIter` hardcodes `folder_id: None` and will not be
+    /// re-pointed — and the friendly types cannot be rebuilt from the answer: `Message::from_raw`
+    /// wants a `PeerMap`, which has no public constructor. So this reads the same three things
+    /// `from_grammers` does straight off the wire, sharing `read_state` and `notify_state` so the
+    /// two paths can never disagree about what a field means.
+    ///
+    /// `None` for the `dialogFolder` row, which stands for a group of chats rather than one, and
+    /// for a peer missing from the response's `users`/`chats` — without its access hash there is no
+    /// `PeerRef` to open the chat with.
+    pub fn from_raw(
+        raw: &tl::enums::Dialog,
+        users: &[tl::enums::User],
+        chats: &[tl::enums::Chat],
+        messages: &[tl::enums::Message],
+    ) -> Option<Self> {
+        let tl::enums::Dialog::Dialog(dialog) = raw else {
+            return None;
+        };
+        let peer = resolve_peer(&dialog.peer, users, chats)?;
+
+        let kind = peer.kind;
+        let (read_outbox_max_id, unread) = read_state(raw, kind.receipts_make_sense());
+        let (pinned, muted) = notify_state(raw, Utc::now().timestamp());
+
+        Some(Self {
+            peer: peer.reference,
+            kind,
+            name: peer.name,
+            preview: raw_preview(&dialog.peer, dialog.top_message, messages),
+            read_outbox_max_id,
+            unread,
+            muted,
+            pinned,
+            blocked: false,
+            archived: true,
+            contact: peer.contact,
+            bot: peer.bot,
+        })
+    }
+}
+
+/// Everything a dialog row needs about its peer, once the response's `users` and `chats` have been
+/// searched for it.
+struct RawPeer {
+    reference: PeerRef,
+    kind: DialogKind,
+    name: String,
+    contact: bool,
+    bot: bool,
+}
+
+fn resolve_peer(
+    peer: &tl::enums::Peer,
+    users: &[tl::enums::User],
+    chats: &[tl::enums::Chat],
+) -> Option<RawPeer> {
+    match peer {
+        tl::enums::Peer::User(peer) => {
+            let found = users.iter().find(|user| user.id() == peer.user_id)?;
+            let tl::enums::User::User(user) = found else {
+                return None;
+            };
+            let name = [user.first_name.as_deref(), user.last_name.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(RawPeer {
+                reference: PeerRef::from(found),
+                kind: DialogKind::User {
+                    is_self: user.is_self,
+                },
+                name: fallback_name(name, user.id),
+                contact: user.contact,
+                bot: user.bot,
+            })
+        }
+        tl::enums::Peer::Chat(peer) => {
+            let found = chats.iter().find(|chat| chat.id() == peer.chat_id)?;
+            let (name, id) = match found {
+                tl::enums::Chat::Chat(chat) => (chat.title.clone(), chat.id),
+                tl::enums::Chat::Forbidden(chat) => (chat.title.clone(), chat.id),
+                _ => return None,
+            };
+            Some(RawPeer {
+                reference: PeerRef::from(found),
+                // A basic group is never a megagroup: that is the channel-shaped kind.
+                kind: DialogKind::Group { megagroup: false },
+                name: fallback_name(name, id),
+                contact: false,
+                bot: false,
+            })
+        }
+        tl::enums::Peer::Channel(peer) => {
+            let found = chats.iter().find(|chat| chat.id() == peer.channel_id)?;
+            let (name, id, megagroup) = match found {
+                tl::enums::Chat::Channel(chat) => (chat.title.clone(), chat.id, chat.megagroup),
+                tl::enums::Chat::ChannelForbidden(chat) => {
+                    (chat.title.clone(), chat.id, chat.megagroup)
+                }
+                _ => return None,
+            };
+            Some(RawPeer {
+                reference: PeerRef::from(found),
+                kind: if megagroup {
+                    DialogKind::Group { megagroup: true }
+                } else {
+                    DialogKind::Channel
+                },
+                name: fallback_name(name, id),
+                contact: false,
+                bot: false,
+            })
+        }
+    }
+}
+
+/// A deleted account has no name at all, and an unnamed row is unclickable. Same fallback the
+/// friendly path uses.
+fn fallback_name(name: String, id: i64) -> String {
+    if name.trim().is_empty() {
+        format!("id {id}")
+    } else {
+        name
+    }
+}
+
+/// The preview line for an archived chat, read off the response's `messages`.
+///
+/// Matched on both peer and id: message ids restart at 1 in every channel, so `top_message` alone
+/// would happily pick another chat's line out of the same response.
+fn raw_preview(
+    peer: &tl::enums::Peer,
+    top_message: i32,
+    messages: &[tl::enums::Message],
+) -> String {
+    let found = messages.iter().find(|message| match message {
+        tl::enums::Message::Message(message) => {
+            message.id == top_message && &message.peer_id == peer
+        }
+        tl::enums::Message::Service(message) => {
+            message.id == top_message && &message.peer_id == peer
+        }
+        tl::enums::Message::Empty(_) => false,
+    });
+
+    match found {
+        Some(tl::enums::Message::Message(message)) if !message.message.is_empty() => message
+            .message
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        // Empty text covers media, which has no preview worth the round trip.
+        Some(tl::enums::Message::Message(_)) => "[media]".to_string(),
+        Some(tl::enums::Message::Service(message)) => {
+            call_label(&message.action, message.out).unwrap_or_default()
+        }
+        _ => String::new(),
     }
 }
 
@@ -94,6 +282,22 @@ fn read_state(raw: &tl::enums::Dialog, ticks: bool) -> (Option<i32>, usize) {
             raw.unread_count.max(0) as usize,
         ),
         tl::enums::Dialog::Folder(_) => (None, 0),
+    }
+}
+
+/// Which folder a dialog row says it is in.
+///
+/// Load-bearing on the *main* path, not just the archive one. `DialogIter` sends
+/// `messages.getDialogs` with `folder_id` absent, and an absent flag does not mean folder 0 — it
+/// means *every* folder, so the main fetch delivers archived chats mixed in with the rest. The row
+/// is the only thing that says which is which, and assuming folder 0 here put archived chats in the
+/// "All" tab.
+///
+/// `dialogFolder` is the archive group rather than a chat in it, so it is not itself archived.
+fn is_archived(raw: &tl::enums::Dialog) -> bool {
+    match raw {
+        tl::enums::Dialog::Dialog(raw) => raw.folder_id == Some(ARCHIVE_FOLDER),
+        tl::enums::Dialog::Folder(_) => false,
     }
 }
 
@@ -118,36 +322,188 @@ fn notify_state(raw: &tl::enums::Dialog, now: i64) -> (bool, bool) {
     (raw.pinned, is_muted(settings.mute_until, now))
 }
 
+/// Which view of the pool is on screen.
+///
+/// A ring, in the order the tab strip draws it: the main list, then the account's own folders, then
+/// the archive. `Custom` indexes [`DialogListState::folders`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FolderTab {
+    #[default]
+    Main,
+    Custom(usize),
+    Archive,
+}
+
+/// How much of one server folder has been read.
+///
+/// Two of these, because the main list and the archive are paged independently and reaching the
+/// end of one says nothing about the other.
 #[derive(Debug, Default)]
-pub struct DialogListState {
-    pub items: Vec<DialogSummary>,
-    pub selected: usize,
+pub struct Cursor {
+    pub loading: bool,
     /// `true` once the server has no more dialogs to give.
     pub exhausted: bool,
-    pub loading: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct DialogListState {
+    /// Every dialog loaded so far, from both server folders. Order is the server's.
+    pub items: Vec<DialogSummary>,
+    /// The account's own folders, in the order the Telegram app shows them.
+    pub folders: Vec<Folder>,
+    pub tab: FolderTab,
+    /// Index into the *visible* list, not into `items` — a filtered tab shows a subset, and this
+    /// is handed straight to ratatui. Kept on the same conversation across every mutation by
+    /// [`DialogListState::keeping_selection`].
+    pub selected: usize,
+    pub main: Cursor,
+    pub archive: Cursor,
 }
 
 impl DialogListState {
+    /// The pool indices the active tab shows, in pool order.
+    ///
+    /// Recomputed on demand rather than cached: `ui::draw` rebuilds every frame from scratch
+    /// anyway, and a stale membership after a mute or an unread change would be a filter lying
+    /// about what it contains.
+    pub fn visible(&self) -> Vec<usize> {
+        (0..self.items.len())
+            .filter(|&index| self.shows(&self.items[index]))
+            .collect()
+    }
+
+    fn shows(&self, item: &DialogSummary) -> bool {
+        match self.tab {
+            FolderTab::Main => !item.archived,
+            FolderTab::Archive => item.archived,
+            FolderTab::Custom(index) => self
+                .folders
+                .get(index)
+                .is_some_and(|folder| folders::matches(&folder.rule, item)),
+        }
+    }
+
+    /// The tabs in strip order, as titles. Always at least "All" and "Archive".
+    pub fn tabs(&self) -> Vec<(FolderTab, String)> {
+        let mut tabs = vec![(FolderTab::Main, "All".to_string())];
+        tabs.extend(
+            self.folders
+                .iter()
+                .enumerate()
+                .map(|(index, folder)| (FolderTab::Custom(index), folder.title.clone())),
+        );
+        tabs.push((FolderTab::Archive, "Archive".to_string()));
+        tabs
+    }
+
+    /// Where the active tab sits in [`DialogListState::tabs`].
+    pub fn tab_index(&self) -> usize {
+        match self.tab {
+            FolderTab::Main => 0,
+            FolderTab::Custom(index) => index + 1,
+            FolderTab::Archive => self.folders.len() + 1,
+        }
+    }
+
+    /// Step to the next or previous tab, wrapping.
+    ///
+    /// Wrapping, unlike the picture viewer's clamped `←`/`→`: the strip is a ring whose ends are
+    /// both on screen, so stepping off one and arriving at the other reads as movement rather than
+    /// as a lost keystroke.
+    pub fn step_tab(&mut self, forward: bool) {
+        let tabs = self.tabs();
+        let count = tabs.len();
+        let next = if forward {
+            (self.tab_index() + 1) % count
+        } else {
+            (self.tab_index() + count - 1) % count
+        };
+        self.tab = tabs[next].0;
+        // A different tab is a different list; carrying an index over would land the highlight on
+        // an unrelated conversation and open it.
+        self.selected = 0;
+    }
+
+    /// Replace the account's folders after `messages.getDialogFilters`.
+    pub fn set_folders(&mut self, folders: Vec<Folder>) {
+        self.keeping_selection(|state| {
+            state.folders = folders;
+            // A folder deleted on another device must not leave the strip pointing past its end.
+            if let FolderTab::Custom(index) = state.tab
+                && index >= state.folders.len()
+            {
+                state.tab = FolderTab::Main;
+            }
+        });
+    }
+
+    /// The cursor for the server folder the active tab reads from.
+    ///
+    /// A custom folder is a filter over the main list, so it pages the main list — which is why
+    /// this is a two-way split and not three.
+    pub fn cursor(&self) -> &Cursor {
+        match self.tab {
+            FolderTab::Archive => &self.archive,
+            _ => &self.main,
+        }
+    }
+
+    pub fn cursor_mut(&mut self) -> &mut Cursor {
+        match self.tab {
+            FolderTab::Archive => &mut self.archive,
+            _ => &mut self.main,
+        }
+    }
+
+    /// Whether the active tab reads the archive rather than the main list.
+    pub fn showing_archive(&self) -> bool {
+        self.tab == FolderTab::Archive
+    }
+
     pub fn selected_peer(&self) -> Option<PeerRef> {
-        self.items.get(self.selected).map(|item| item.peer)
+        self.selected_summary().map(|item| item.peer)
     }
 
     pub fn selected_summary(&self) -> Option<&DialogSummary> {
-        self.items.get(self.selected)
+        let index = *self.visible().get(self.selected)?;
+        self.items.get(index)
     }
 
     pub fn find(&self, peer_id: PeerId) -> Option<&DialogSummary> {
         self.items.iter().find(|item| item.peer.id == peer_id)
     }
 
-    pub fn extend(&mut self, items: Vec<DialogSummary>, exhausted: bool) {
-        self.loading = false;
-        self.exhausted = exhausted;
-        self.items.extend(items);
+    /// Fold a page into the pool.
+    ///
+    /// Deduped by peer, because the two cursors overlap: the main fetch asks for every folder at
+    /// once (see [`is_archived`]), so an archived chat can arrive from it *and* from the archive's
+    /// own paging. The row already held wins — it is the one carrying whatever this session has
+    /// since done to it, and a second copy would show as a duplicate row and take a `j` of its own
+    /// to scroll past.
+    pub fn extend(&mut self, items: Vec<DialogSummary>, exhausted: bool, archived: bool) {
+        let cursor = if archived {
+            &mut self.archive
+        } else {
+            &mut self.main
+        };
+        cursor.loading = false;
+        cursor.exhausted = exhausted;
+
+        self.keeping_selection(|state| {
+            for item in items {
+                match state.index_of(item.peer.id) {
+                    // Not new, but the server has just restated which folder it is in — and that
+                    // may be news, since nothing else tells us about a chat archived elsewhere
+                    // while this client was not running.
+                    Some(index) => state.items[index].archived = item.archived,
+                    None => state.items.push(item),
+                }
+            }
+        });
     }
 
     pub fn select_next(&mut self) {
-        if !self.items.is_empty() && self.selected + 1 < self.items.len() {
+        if self.selected + 1 < self.visible().len() {
             self.selected += 1;
         }
     }
@@ -157,8 +513,15 @@ impl DialogListState {
     }
 
     /// Whether scrolling has come close enough to the end to warrant fetching another page.
+    ///
+    /// Measured against the *visible* list. On a custom folder that means a sparse one keeps
+    /// pulling pages of the main list until it has rows to show or the account runs out — the
+    /// price of folders being filters Telegram evaluates client-side rather than a query.
     pub fn wants_more(&self) -> bool {
-        !self.exhausted && !self.loading && self.selected + PREFETCH_MARGIN >= self.items.len()
+        let cursor = self.cursor();
+        !cursor.exhausted
+            && !cursor.loading
+            && self.selected + PREFETCH_MARGIN >= self.visible().len()
     }
 
     /// Move an existing dialog to the top and refresh its preview after a new message.
@@ -168,6 +531,43 @@ impl DialogListState {
         };
         self.items[index].preview = preview;
         self.move_to_top(index);
+    }
+
+    /// Move a chat between the main list and the archive, after the server confirmed it.
+    ///
+    /// The row stays in the pool: the conversation still exists, it is just in the other folder
+    /// now, and dropping it would throw away everything known about it — including, for a chat
+    /// archived from a phone, a summary the archive tab has not paged in yet.
+    pub fn set_archived(&mut self, peer_id: PeerId, archived: bool) {
+        self.keeping_selection(|state| {
+            if let Some(item) = state.find_mut(peer_id) {
+                item.archived = archived;
+            }
+        });
+    }
+
+    /// Run a mutation and leave the highlight on whichever conversation it was on.
+    ///
+    /// `selected` indexes the visible list, so nothing can adjust it arithmetically the way a
+    /// single flat list could: a row can leave the view by being removed, by being reordered, by
+    /// moving to the other folder, or by a folder rule changing under it. Anchoring on the peer
+    /// covers all four, and falling back to the old position is what hands the highlight to
+    /// whatever moved up into the vacated slot — including when that slot was the last one.
+    fn keeping_selection<R>(&mut self, change: impl FnOnce(&mut Self) -> R) -> R {
+        let anchor = self.selected_peer().map(|peer| peer.id);
+        let position = self.selected;
+
+        let result = change(self);
+
+        let visible = self.visible();
+        self.selected = anchor
+            .and_then(|id| {
+                visible
+                    .iter()
+                    .position(|&index| self.items[index].peer.id == id)
+            })
+            .unwrap_or_else(|| position.min(visible.len().saturating_sub(1)));
+        result
     }
 
     /// Blank a chat's preview line, because its history was just emptied.
@@ -220,20 +620,13 @@ impl DialogListState {
     /// Returns whether a row actually went, because the caller has to close the chat pane if it
     /// was the open one.
     pub fn remove(&mut self, peer_id: PeerId) -> bool {
-        let Some(index) = self.index_of(peer_id) else {
-            return false;
-        };
-        self.items.remove(index);
-
-        // `selected` is a bare index, so a removal above it shifts the wrong row under the
-        // highlight, and removing the last row leaves it out of bounds entirely. Rows below the
-        // selection need no adjustment; the row *at* the selection hands the highlight to whatever
-        // moved up into its place.
-        if self.selected > index {
-            self.selected -= 1;
-        }
-        self.selected = self.selected.min(self.items.len().saturating_sub(1));
-        true
+        self.keeping_selection(|state| {
+            let Some(index) = state.index_of(peer_id) else {
+                return false;
+            };
+            state.items.remove(index);
+            true
+        })
     }
 
     fn index_of(&self, peer_id: PeerId) -> Option<usize> {
@@ -242,14 +635,10 @@ impl DialogListState {
 
     /// Move a row to the front, keeping the highlight on the conversation it was already on.
     fn move_to_top(&mut self, index: usize) {
-        let item = self.items.remove(index);
-        self.items.insert(0, item);
-
-        if self.selected == index {
-            self.selected = 0;
-        } else if self.selected < index {
-            self.selected += 1;
-        }
+        self.keeping_selection(|state| {
+            let item = state.items.remove(index);
+            state.items.insert(0, item);
+        });
     }
 
     /// Raise the watermark after the other side reported reading up to `max_id`.
@@ -302,7 +691,12 @@ impl DialogListState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{dialog, raw_dialog, raw_dialog_with, raw_folder};
+    use grammers_session::types::PeerAuth;
+
+    use crate::test_support::{
+        archived_dialog, dialog, folder, raw_channel, raw_dialog, raw_dialog_with, raw_folder,
+        raw_message, raw_user,
+    };
 
     fn list(count: i64) -> DialogListState {
         DialogListState {
@@ -311,6 +705,15 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// The names the active tab shows, in the order it shows them.
+    fn names(state: &DialogListState) -> Vec<&str> {
+        state
+            .visible()
+            .into_iter()
+            .map(|index| state.items[index].name.as_str())
+            .collect()
     }
 
     /// Whichever conversation was highlighted must stay highlighted after a reorder.
@@ -382,12 +785,318 @@ mod tests {
         state.selected = state.items.len() - PREFETCH_MARGIN;
         assert!(state.wants_more());
 
-        state.loading = true;
+        state.main.loading = true;
         assert!(!state.wants_more(), "must not stack requests while loading");
 
-        state.loading = false;
-        state.exhausted = true;
+        state.main.loading = false;
+        state.main.exhausted = true;
         assert!(!state.wants_more(), "must stop once the server is drained");
+    }
+
+    /// The bug this pins: `messages.getDialogs` with the `folder_id` flag *absent* means every
+    /// folder, not folder 0, so the main fetch delivers archived chats and only the row itself says
+    /// so. Reading it wrong put them in the "All" tab.
+    #[test]
+    fn the_main_fetch_files_its_archived_rows_under_the_archive_tab() {
+        let archived = tl::enums::Dialog::Dialog(tl::types::Dialog {
+            folder_id: Some(1),
+            ..match raw_dialog(0, 0) {
+                tl::enums::Dialog::Dialog(dialog) => dialog,
+                tl::enums::Dialog::Folder(_) => unreachable!(),
+            }
+        });
+
+        assert!(is_archived(&archived));
+        assert!(
+            !is_archived(&raw_dialog(0, 0)),
+            "no folder on the row is the main list"
+        );
+        assert!(
+            !is_archived(&raw_folder()),
+            "`dialogFolder` is the archive group itself, not a chat inside it"
+        );
+    }
+
+    #[test]
+    fn a_chat_both_cursors_deliver_is_held_once() {
+        let mut state = DialogListState::default();
+
+        state.extend(vec![archived_dialog(1, "Old friend")], false, false);
+        state.extend(vec![archived_dialog(1, "Old friend")], true, true);
+
+        assert_eq!(
+            state.items.len(),
+            1,
+            "the main fetch covers every folder, so the archive's own paging restates rows it \
+             already delivered"
+        );
+    }
+
+    #[test]
+    fn a_restated_row_brings_its_folder_up_to_date() {
+        let mut state = list(1);
+        let peer = state.items[0].peer.id;
+
+        state.extend(vec![archived_dialog(1, "chat 1")], false, false);
+
+        assert_eq!(state.items.len(), 1);
+        assert!(
+            state.find(peer).unwrap().archived,
+            "a chat archived from a phone while this client was off is only reported by the row"
+        );
+    }
+
+    // -- folder tabs ---------------------------------------------------------
+
+    /// Both server folders live in one `items`, so every tab is a filter and none of them owns a
+    /// list of its own.
+    #[test]
+    fn each_tab_shows_its_own_slice_of_the_one_pool() {
+        let mut state = list(2);
+        state.items.push(archived_dialog(9, "old friend"));
+        let work = state.items[0].peer.id;
+        state.folders = vec![folder("Work", &[work])];
+
+        assert_eq!(names(&state), ["chat 1", "chat 2"]);
+
+        state.tab = FolderTab::Custom(0);
+        assert_eq!(names(&state), ["chat 1"]);
+
+        state.tab = FolderTab::Archive;
+        assert_eq!(
+            names(&state),
+            ["old friend"],
+            "an archived chat belongs to the archive tab and to no other view by default"
+        );
+    }
+
+    #[test]
+    fn stepping_through_the_tabs_wraps_at_both_ends() {
+        let mut state = list(1);
+        state.folders = vec![folder("Work", &[]), folder("Personal", &[])];
+
+        let mut seen = vec![state.tab];
+        for _ in 0..3 {
+            state.step_tab(true);
+            seen.push(state.tab);
+        }
+        assert_eq!(
+            seen,
+            [
+                FolderTab::Main,
+                FolderTab::Custom(0),
+                FolderTab::Custom(1),
+                FolderTab::Archive
+            ]
+        );
+
+        state.step_tab(true);
+        assert_eq!(state.tab, FolderTab::Main, "the strip is a ring");
+        state.step_tab(false);
+        assert_eq!(state.tab, FolderTab::Archive, "and it turns both ways");
+    }
+
+    #[test]
+    fn a_tab_switch_starts_the_selection_at_the_top_of_the_new_list() {
+        let mut state = list(5);
+        state.selected = 4;
+
+        state.step_tab(true);
+
+        assert_eq!(
+            state.selected, 0,
+            "carrying the index over would highlight — and open — an unrelated conversation"
+        );
+    }
+
+    #[test]
+    fn a_folder_deleted_elsewhere_does_not_leave_the_strip_pointing_past_its_end() {
+        let mut state = list(1);
+        state.folders = vec![folder("Work", &[]), folder("Personal", &[])];
+        state.tab = FolderTab::Custom(1);
+
+        state.set_folders(vec![folder("Work", &[])]);
+
+        assert_eq!(state.tab, FolderTab::Main);
+    }
+
+    #[test]
+    fn the_archive_tab_pages_the_archive_and_every_other_tab_pages_the_main_list() {
+        let mut state = list(1);
+        state.main.exhausted = true;
+        state.archive.exhausted = false;
+
+        assert!(!state.wants_more());
+
+        state.tab = FolderTab::Archive;
+        assert!(
+            state.wants_more(),
+            "the archive is a separate cursor; draining the main list says nothing about it"
+        );
+    }
+
+    /// A folder is a filter over the main list, so it has to keep pulling pages until it has rows
+    /// of its own — the server will not answer "the chats in Work".
+    #[test]
+    fn a_folder_with_nothing_in_it_yet_keeps_asking_for_more_of_the_main_list() {
+        let mut state = list(30);
+        state.folders = vec![folder("Work", &[])];
+        state.tab = FolderTab::Custom(0);
+
+        assert!(state.visible().is_empty());
+        assert!(state.wants_more());
+    }
+
+    // -- the archive parser --------------------------------------------------
+
+    /// The peer of the row `raw_dialog` builds, which names user 1.
+    fn user_peer() -> tl::enums::Peer {
+        tl::enums::Peer::User(tl::types::PeerUser { user_id: 1 })
+    }
+
+    #[test]
+    fn an_archived_row_is_built_from_the_wire_with_everything_the_list_draws() {
+        let summary = DialogSummary::from_raw(
+            &raw_dialog(42, 3),
+            &[raw_user(1, "Alice", true, false)],
+            &[],
+            &[raw_message(
+                user_peer(),
+                42,
+                "see you then\nand bring the map",
+            )],
+        )
+        .expect("a private chat with its peer in the response resolves");
+
+        assert_eq!(summary.name, "Alice");
+        assert_eq!(
+            summary.preview, "see you then",
+            "the preview is one line, whatever the message is"
+        );
+        assert_eq!(summary.read_outbox_max_id, Some(42));
+        assert_eq!(summary.unread, 3);
+        assert!(summary.contact && !summary.bot);
+        assert!(
+            summary.archived,
+            "this path exists only for folder 1, so nothing it builds belongs in the main list"
+        );
+        assert_eq!(
+            summary.peer.auth,
+            PeerAuth::from_hash(1),
+            "the access hash off the response is what opens and sends to an archived chat — \
+             nothing else has cached this peer"
+        );
+    }
+
+    #[test]
+    fn an_archived_megagroup_is_a_group_rather_than_a_channel() {
+        let raw = tl::enums::Dialog::Dialog(tl::types::Dialog {
+            peer: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 }),
+            ..match raw_dialog(0, 0) {
+                tl::enums::Dialog::Dialog(dialog) => dialog,
+                tl::enums::Dialog::Folder(_) => unreachable!(),
+            }
+        });
+
+        let group = DialogSummary::from_raw(&raw, &[], &[raw_channel(5, "Rust Users", true)], &[])
+            .expect("a channel-shaped peer in the response resolves");
+        assert_eq!(group.kind, DialogKind::Group { megagroup: true });
+
+        let channel =
+            DialogSummary::from_raw(&raw, &[], &[raw_channel(5, "Rust Blog", false)], &[])
+                .expect("a broadcast channel resolves the same way");
+        assert_eq!(channel.kind, DialogKind::Channel);
+        assert_eq!(
+            channel.read_outbox_max_id, None,
+            "a broadcast channel has readers rather than a recipient, on this path too"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_peer_the_response_left_out_is_dropped_rather_than_guessed() {
+        assert!(
+            DialogSummary::from_raw(&raw_dialog(1, 0), &[], &[], &[]).is_none(),
+            "without the access hash there is no `PeerRef`, so the row could never be opened"
+        );
+    }
+
+    #[test]
+    fn the_archive_folder_row_is_not_a_conversation() {
+        assert!(
+            DialogSummary::from_raw(&raw_folder(), &[], &[], &[]).is_none(),
+            "`dialogFolder` stands for a group of chats and has none of the fields a row needs"
+        );
+    }
+
+    /// Message ids restart at 1 in every channel, so a response holding several chats has several
+    /// messages that could answer to the same `top_message`.
+    #[test]
+    fn a_preview_comes_from_the_right_chats_message_and_not_just_the_right_id() {
+        let summary = DialogSummary::from_raw(
+            &raw_dialog(7, 0),
+            &[raw_user(1, "Alice", false, false)],
+            &[raw_channel(5, "Rust Blog", false)],
+            &[
+                raw_message(
+                    tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 5 }),
+                    7,
+                    "someone else's line",
+                ),
+                raw_message(user_peer(), 7, "ours"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(summary.preview, "ours");
+    }
+
+    // -- archiving -----------------------------------------------------------
+
+    #[test]
+    fn archiving_moves_a_chat_between_tabs_instead_of_dropping_it() {
+        let mut state = list(2);
+        let peer = state.items[0].peer.id;
+
+        state.set_archived(peer, true);
+
+        assert_eq!(names(&state), ["chat 2"]);
+        state.tab = FolderTab::Archive;
+        assert_eq!(names(&state), ["chat 1"]);
+
+        state.set_archived(peer, false);
+        assert!(
+            state.visible().is_empty(),
+            "unarchiving must take the row back out of the archive"
+        );
+        assert_eq!(
+            state.items.len(),
+            2,
+            "the conversation still exists; only its folder changed"
+        );
+    }
+
+    #[test]
+    fn a_chat_archived_from_under_the_selection_hands_the_highlight_on() {
+        let mut state = list(3);
+        state.selected = 1;
+
+        state.set_archived(state.items[1].peer.id, true);
+
+        assert_eq!(
+            state.items[state.visible()[state.selected]].name,
+            "chat 3",
+            "the row that moved up into the vacated slot is the natural next selection"
+        );
+    }
+
+    #[test]
+    fn the_highlight_stays_on_its_chat_when_a_row_above_it_is_archived() {
+        let mut state = list(4);
+        state.selected = 2;
+
+        state.set_archived(state.items[0].peer.id, true);
+
+        assert_eq!(state.items[state.visible()[state.selected]].name, "chat 3");
     }
 
     // -- read state ----------------------------------------------------------

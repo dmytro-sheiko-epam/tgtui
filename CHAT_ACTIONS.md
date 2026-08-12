@@ -29,12 +29,12 @@ precisely because the server counts from a read pointer this client never moves.
 clears the badge locally only. Nothing in this feature changes that — `client.mark_as_read` exists
 in grammers 0.10 and is deliberately not called.
 
-### Archive is one-way
+### Archive is a toggle (superseded)
 
-`DialogIter` sends `messages.getDialogs` with `folder_id: None`, which returns folder 0 plus a
-single `dialogFolder` row. Archived chats are therefore *not in the list at all*. So archiving
-removes the row, and there is no unarchive — there is no archive view for it to live in. Say this
-in the menu label ("Archive (hides the chat)") rather than pretending it toggles.
+This section used to read "Archive is one-way". It no longer is: the chat list now carries a strip
+of folder tabs, one of which is the Archive, so the menu offers Unarchive on a chat that is in it
+and the label is plain "Archive". Both directions are the same `folders.editPeerFolders` with a
+different folder id. See the folder-tabs paragraphs in `CLAUDE.md`.
 
 ### Blocked state has to be fetched
 
@@ -170,7 +170,8 @@ corrected.)
 
 - **Mark as read.** Ruled out by you. `client.mark_as_read` exists and is never called; the
   `min`-clamp in `reconcile_unread` stays correct because opening a chat still moves no pointer.
-- **Unarchive.** No archive view to do it from — see the note above on folder 0.
+- **Editing the folders themselves.** The tabs are read with `messages.getDialogFilters` and never
+  written; creating, renaming or reordering a folder stays in the Telegram app.
 - **Anything needing admin rights**: adding members, changing titles, clearing a megagroup.
 - **Timed mutes.** The menu mutes forever (`mute_until = i32::MAX`) or not at all.
 

@@ -227,13 +227,23 @@ impl App {
                 self.submitting = false;
                 self.login_error = Some(error);
             }
-            TgEvent::DialogsLoaded { items, exhausted } => {
-                self.dialogs.extend(items, exhausted);
+            TgEvent::DialogsLoaded {
+                items,
+                exhausted,
+                archived,
+            } => {
+                self.dialogs.extend(items, exhausted, archived);
                 // Show something as soon as the first page lands.
                 if self.open_chat.is_none() {
                     self.open_selected_chat();
                 }
+                // A custom folder is a filter over the main list, so a page that added nothing to
+                // it has to pull the next one straight away — without this the strip would sit on
+                // an empty folder until the user pressed `j`, which there is nothing to press on.
+                self.load_more_dialogs_if_needed();
             }
+            TgEvent::FoldersLoaded { folders } => self.dialogs.set_folders(folders),
+            TgEvent::FolderChanged { peer, archived } => self.refile_dialog(peer, archived),
             TgEvent::MessagesLoaded { peer, messages } => {
                 if let Some(buffer) = self.chats.get_mut(&peer) {
                     buffer.set_initial(messages);
@@ -421,16 +431,35 @@ impl App {
         }
     }
 
+    /// Move a conversation between the main list and the archive.
+    ///
+    /// Deliberately *not* [`App::forget_dialog`]: the conversation still exists and its transcript
+    /// is still worth keeping, so the `ChatBuffer` stays and only the row's folder changes. The
+    /// chat pane is left showing it too — a chat you just archived is one you were reading a
+    /// second ago, and closing it would be a surprise. Only the selection has to be caught, and
+    /// `set_archived` has already put that somewhere valid in the tab now on screen.
+    fn refile_dialog(&mut self, peer: PeerId, archived: bool) {
+        let Some(name) = self.dialogs.find(peer).map(|item| item.name.clone()) else {
+            return;
+        };
+        self.dialogs.set_archived(peer, archived);
+
+        let reason = if archived { "archived" } else { "unarchived" };
+        self.set_status(format!("{name} — {reason}"), StatusKind::Info);
+    }
+
     fn enter_main(&mut self) {
         self.submitting = false;
         self.login_error = None;
         self.input.clear();
         self.screen = Screen::Main;
-        self.dialogs.loading = true;
-        self.send(TgCommand::LoadMoreDialogs);
+        self.dialogs.main.loading = true;
+        self.send(TgCommand::LoadMoreDialogs { archived: false });
         // Nothing on a dialog row says whether a user is blocked, so the action menu would have no
         // way to offer "Unblock" without this.
         self.send(TgCommand::LoadBlockedPeers);
+        // The tab strip needs its folders before it can draw anything but "All" and "Archive".
+        self.send(TgCommand::LoadFolders);
     }
 
     // -- keyboard ------------------------------------------------------------
@@ -506,6 +535,14 @@ impl App {
         if ctrl && key.code == KeyCode::Char('a') {
             return self.open_menu();
         }
+        // After the viewer for the same reason as the menu: with a picture open the chat list is
+        // not drawn, so changing which folder it shows would be a change nobody can see.
+        if ctrl && matches!(key.code, KeyCode::Char('o')) {
+            return self.step_folder(true);
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('e')) {
+            return self.step_folder(false);
+        }
 
         match key.code {
             KeyCode::Tab => {
@@ -528,6 +565,17 @@ impl App {
             Focus::Chats => self.handle_chats_key(key),
             Focus::Messages => self.handle_messages_key(key),
         }
+    }
+
+    /// Show the next or previous folder in the tab strip.
+    ///
+    /// Opening whatever the new tab starts on keeps the two panes agreeing with each other, and it
+    /// is what makes the first `Ctrl+O` into the archive fetch its first page: the archive has a
+    /// cursor of its own that nothing has asked for yet.
+    fn step_folder(&mut self, forward: bool) {
+        self.dialogs.step_tab(forward);
+        self.open_selected_chat();
+        self.load_more_dialogs_if_needed();
     }
 
     fn handle_chats_key(&mut self, key: KeyEvent) {
@@ -663,7 +711,13 @@ impl App {
             peer: summary.peer,
             kind: summary.kind,
             name: summary.name.clone(),
-            actions: actions_for(summary.kind, summary.muted, summary.pinned, summary.blocked),
+            actions: actions_for(
+                summary.kind,
+                summary.muted,
+                summary.pinned,
+                summary.blocked,
+                summary.archived,
+            ),
             selected: 0,
             confirming: None,
         });
@@ -722,7 +776,14 @@ impl App {
                 peer,
                 pinned: false,
             },
-            DialogAction::Archive => TgCommand::Archive { peer },
+            DialogAction::Archive => TgCommand::SetArchived {
+                peer,
+                archived: true,
+            },
+            DialogAction::Unarchive => TgCommand::SetArchived {
+                peer,
+                archived: false,
+            },
             DialogAction::ClearHistory => TgCommand::ClearHistory { peer },
             DialogAction::Block => TgCommand::SetBlocked {
                 peer,
@@ -828,8 +889,9 @@ impl App {
 
     fn load_more_dialogs_if_needed(&mut self) {
         if self.dialogs.wants_more() {
-            self.dialogs.loading = true;
-            self.send(TgCommand::LoadMoreDialogs);
+            let archived = self.dialogs.showing_archive();
+            self.dialogs.cursor_mut().loading = true;
+            self.send(TgCommand::LoadMoreDialogs { archived });
         }
     }
 
@@ -874,10 +936,11 @@ impl App {
 mod tests {
     use super::*;
     use crate::state::chat_buffer::PAGE_SIZE;
+    use crate::state::dialog_list::FolderTab;
     use crate::telegram::TgEvent;
     use crate::test_support::{
-        app, channel, channel_dialog, dialog, drain, gradient, group_dialog, message, outgoing,
-        page, peer, photo_message,
+        app, archived_dialog, channel, channel_dialog, dialog, drain, folder, gradient,
+        group_dialog, message, outgoing, page, peer, photo_message,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -891,6 +954,7 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![dialog(1, "Alice"), dialog(2, "Bob")],
             exhausted: true,
+            archived: false,
         });
         app.handle_event(TgEvent::MessagesLoaded {
             peer: peer(1).id,
@@ -919,7 +983,11 @@ mod tests {
         assert!(matches!(app.screen, Screen::Main));
         assert!(matches!(
             drain(&mut rx).as_slice(),
-            [TgCommand::LoadMoreDialogs, TgCommand::LoadBlockedPeers]
+            [
+                TgCommand::LoadMoreDialogs { archived: false },
+                TgCommand::LoadBlockedPeers,
+                TgCommand::LoadFolders,
+            ]
         ));
     }
 
@@ -956,8 +1024,9 @@ mod tests {
                 TgCommand::RequestLoginCode { .. },
                 TgCommand::SignIn { .. },
                 TgCommand::CheckPassword { .. },
-                TgCommand::LoadMoreDialogs,
+                TgCommand::LoadMoreDialogs { archived: false },
                 TgCommand::LoadBlockedPeers,
+                TgCommand::LoadFolders,
             ]
         ));
     }
@@ -1002,12 +1071,18 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![dialog(1, "Alice")],
             exhausted: false,
+            archived: false,
         });
 
         assert_eq!(app.open_chat, Some(peer(1).id));
+        // The page also leaves the list one row long and the server not yet drained, so the
+        // prefetch fires without waiting for a keypress.
         assert!(matches!(
             drain(&mut rx).as_slice(),
-            [TgCommand::OpenChat { .. }]
+            [
+                TgCommand::OpenChat { .. },
+                TgCommand::LoadMoreDialogs { archived: false }
+            ]
         ));
     }
 
@@ -1312,6 +1387,7 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![dialog(1, "Alice")],
             exhausted: true,
+            archived: false,
         });
         app.handle_event(TgEvent::MessagesLoaded {
             peer: peer(1).id,
@@ -1815,6 +1891,7 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![dialog(7, "Alice"), channel_dialog(7, "Announcements")],
             exhausted: true,
+            archived: false,
         });
 
         app.handle_event(TgEvent::OutgoingRead {
@@ -1909,6 +1986,7 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![group_dialog(5, "Rust Users")],
             exhausted: true,
+            archived: false,
         });
 
         app.handle_key(ctrl(KeyCode::Char('a')));
@@ -2109,6 +2187,7 @@ mod tests {
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![dialog(1, "Alice")],
             exhausted: true,
+            archived: false,
         });
 
         app.handle_event(TgEvent::DialogGone {
@@ -2144,5 +2223,144 @@ mod tests {
         app.handle_key(ctrl(KeyCode::Char('a')));
 
         assert!(menu_labels(&app).contains(&"Unblock user"));
+    }
+
+    // -- folder tabs ---------------------------------------------------------
+
+    #[test]
+    fn ctrl_o_and_ctrl_e_step_through_the_folders_in_opposite_directions() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_event(TgEvent::FoldersLoaded {
+            folders: vec![folder("Work", &[peer(2).id])],
+        });
+
+        app.handle_key(ctrl(KeyCode::Char('o')));
+        assert_eq!(app.dialogs.tab, FolderTab::Custom(0));
+
+        app.handle_key(ctrl(KeyCode::Char('o')));
+        assert_eq!(app.dialogs.tab, FolderTab::Archive);
+
+        app.handle_key(ctrl(KeyCode::Char('e')));
+        assert_eq!(app.dialogs.tab, FolderTab::Custom(0));
+    }
+
+    /// The archive has a cursor of its own that nothing has asked for yet, so arriving on the tab
+    /// is what has to fetch its first page — there is no row there to scroll to the end of.
+    #[test]
+    fn arriving_at_the_archive_fetches_it_once() {
+        let (mut app, mut rx) = opened_chat();
+
+        app.handle_key(ctrl(KeyCode::Char('o')));
+
+        assert_eq!(app.dialogs.tab, FolderTab::Archive);
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::LoadMoreDialogs { archived: true }]
+        ));
+
+        // The in-flight guard is the archive's own, and it stops the very next frame asking again.
+        assert!(app.dialogs.archive.loading);
+        app.handle_key(ctrl(KeyCode::Char('e')));
+        app.handle_key(ctrl(KeyCode::Char('o')));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_page_of_archived_chats_lands_in_the_archive_tab_and_nowhere_else() {
+        let (mut app, _rx) = opened_chat();
+        app.dialogs.main.exhausted = false;
+
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![archived_dialog(7, "Old group")],
+            exhausted: true,
+            archived: true,
+        });
+
+        assert_eq!(
+            app.dialogs.visible().len(),
+            2,
+            "the main list must not grow by an archived chat"
+        );
+        assert!(
+            !app.dialogs.main.exhausted,
+            "an archive page says nothing about how much of the main list is left"
+        );
+        assert!(app.dialogs.archive.exhausted);
+
+        app.dialogs.tab = FolderTab::Archive;
+        assert_eq!(app.dialogs.selected_summary().unwrap().name, "Old group");
+    }
+
+    #[test]
+    fn the_menu_on_an_archived_chat_offers_the_way_back_out() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_event(TgEvent::FolderChanged {
+            peer: peer(1).id,
+            archived: true,
+        });
+        app.dialogs.tab = FolderTab::Archive;
+        drain(&mut rx);
+
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        assert!(menu_labels(&app).contains(&"Unarchive"));
+        assert!(!menu_labels(&app).contains(&"Archive"));
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::SetArchived {
+                archived: false,
+                ..
+            }]
+        ));
+    }
+
+    /// Archiving is not deleting: the conversation carries on existing in another tab, so throwing
+    /// its transcript away would mean fetching the whole thing again to read it there.
+    #[test]
+    fn archiving_moves_the_chat_without_closing_it_or_dropping_its_history() {
+        let (mut app, _rx) = opened_chat();
+        assert!(app.chats.contains_key(&peer(1).id));
+
+        app.handle_event(TgEvent::FolderChanged {
+            peer: peer(1).id,
+            archived: true,
+        });
+
+        assert!(app.dialogs.find(peer(1).id).unwrap().archived);
+        assert!(app.chats.contains_key(&peer(1).id));
+        assert_eq!(app.open_chat, Some(peer(1).id));
+        assert_eq!(app.status.as_ref().unwrap().text, "Alice — archived");
+    }
+
+    /// A folder is a filter over the main list, so an empty one has to keep pulling pages by
+    /// itself — there is no row in it to scroll to the end of.
+    #[test]
+    fn an_empty_folder_keeps_paging_the_main_list_without_a_keypress() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_event(TgEvent::FoldersLoaded {
+            folders: vec![folder("Work", &[peer(99).id])],
+        });
+        app.dialogs.main.exhausted = false;
+        app.handle_key(ctrl(KeyCode::Char('o')));
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![dialog(3, "Carol")],
+            exhausted: false,
+            archived: false,
+        });
+
+        assert!(app.dialogs.visible().is_empty());
+        assert!(
+            matches!(
+                drain(&mut rx).as_slice(),
+                [TgCommand::LoadMoreDialogs { archived: false }]
+            ),
+            "a page that added nothing to the folder must fetch the next one on its own"
+        );
     }
 }
