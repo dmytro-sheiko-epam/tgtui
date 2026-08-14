@@ -12,6 +12,7 @@ use crate::state::chat_buffer::ChatBuffer;
 use crate::state::dialog_actions::{DialogAction, DialogKind, actions_for};
 use crate::state::dialog_list::DialogListState;
 use crate::state::media::{PhotoRef, PhotoSource, PhotoState};
+use crate::state::message_actions::{self, MessageAction};
 use crate::telegram::{TgCommand, TgEvent};
 
 /// How long a status banner stays on screen before it fades away.
@@ -102,6 +103,45 @@ impl ChatMenu {
     }
 }
 
+/// The action menu for one message, open over the transcript.
+///
+/// Snapshots the message id for the same reason [`ChatMenu`] snapshots the peer: live updates move
+/// the transcript under the popup, and the action must land on the message the user was pointing at
+/// when they opened it.
+#[derive(Debug)]
+pub struct MessageMenu {
+    pub peer: PeerRef,
+    pub message_id: i32,
+    pub actions: Vec<MessageAction>,
+    pub selected: usize,
+    pub confirming: Option<MessageAction>,
+}
+
+impl MessageMenu {
+    pub fn action(&self) -> Option<MessageAction> {
+        self.actions.get(self.selected).copied()
+    }
+
+    pub fn prompt(&self) -> Option<String> {
+        self.confirming.map(MessageAction::confirm_prompt)
+    }
+}
+
+/// Choosing where a message is going.
+///
+/// Carries the messages rather than looking them up when Enter lands: the menu that opened this has
+/// closed and the cursor may have moved on, but what is being forwarded was decided back then.
+#[derive(Debug)]
+pub struct ForwardPicker {
+    pub source: PeerRef,
+    pub ids: Vec<i32>,
+    /// Typed into rather than navigated with letters, so this modal takes plain characters where
+    /// the two menus take `j` and `k`.
+    pub filter: String,
+    /// An index into the *filtered* rows, so it has to be clamped whenever the filter narrows.
+    pub selected: usize,
+}
+
 pub struct App {
     pub screen: Screen,
     /// Text being typed on whichever login screen is active.
@@ -114,6 +154,12 @@ pub struct App {
     pub chats: HashMap<PeerId, ChatBuffer>,
     pub open_chat: Option<PeerId>,
     pub compose: String,
+    /// The message the compose box is rewriting, if it is rewriting one rather than writing a new
+    /// one. Set by the Edit entry, cleared when the edit is sent or abandoned.
+    pub editing: Option<i32>,
+    /// The message the next send will be threaded to. Mutually exclusive with `editing` — an edit
+    /// replaces text and cannot also change what a message replies to.
+    pub replying_to: Option<i32>,
     pub focus: Focus,
     pub metrics: ChatViewMetrics,
     /// The picture being examined full screen. Modal: while it is set, keys go to the viewer and
@@ -121,6 +167,15 @@ pub struct App {
     pub viewer: Option<i32>,
     /// The chat action menu. Modal too, but a popup: the panes stay drawn behind it.
     pub menu: Option<ChatMenu>,
+    /// The action menu for the message under the cursor. Modal in the same way.
+    pub message_menu: Option<MessageMenu>,
+    /// Picking a destination for a forward. Modal, and outranks both menus — by the time it is up
+    /// the menu that opened it has closed.
+    pub forward: Option<ForwardPicker>,
+    /// The cursor moved and the transcript has not been redrawn yet, so it may be off screen.
+    /// Consumed by `chat_view::render_transcript`, which is the only code that knows where a
+    /// message sits in lines.
+    pub scroll_to_selection: bool,
     /// `TGTUI_IMAGE_ROWS`, if set: an absolute cap on how tall an inline picture may be.
     pub image_rows: Option<u16>,
     /// Photo messages the last frame actually drew, in transcript order so the newest is last.
@@ -145,10 +200,15 @@ impl App {
             chats: HashMap::new(),
             open_chat: None,
             compose: String::new(),
+            editing: None,
+            replying_to: None,
             focus: Focus::Chats,
             metrics: ChatViewMetrics::default(),
             viewer: None,
             menu: None,
+            message_menu: None,
+            forward: None,
+            scroll_to_selection: false,
             image_rows: None,
             visible_photos: Vec::new(),
             should_quit: false,
@@ -280,6 +340,29 @@ impl App {
                 }
                 self.dialogs.bump(peer, message.text);
             }
+            // The new text is not here: it arrives as `updateEditMessage` and is applied by the
+            // `IncomingMessage { edited: true }` arm below, which also keeps the decoded picture.
+            TgEvent::MessageEdited => self.set_status("edited", StatusKind::Info),
+            TgEvent::MessagesForwarded { destination } => {
+                let where_to = self
+                    .dialogs
+                    .find(destination)
+                    .map(|item| item.name.clone())
+                    .unwrap_or_else(|| "another chat".to_string());
+                self.set_status(format!("forwarded to {where_to}"), StatusKind::Info);
+            }
+            TgEvent::ReplyTargetsLoaded {
+                peer,
+                asked,
+                targets,
+            } => {
+                if let Some(buffer) = self.chats.get_mut(&peer) {
+                    // `asked` rather than `targets`: a parent that has been deleted comes back as
+                    // nothing, and the guard has to hold for it too or the next frame asks again.
+                    buffer.reply_requested.extend(asked);
+                    buffer.reply_previews.extend(targets);
+                }
+            }
             TgEvent::MessagesDeleted { channel, ids } => self.remove_messages(channel, &ids),
             TgEvent::IncomingMessage {
                 peer,
@@ -346,6 +429,9 @@ impl App {
                 if let Some(buffer) = self.chats.get_mut(&peer) {
                     buffer.clear();
                 }
+                // `clear` has taken the cursor with the messages, so a menu still open over them
+                // would be pointing at a message that no longer exists.
+                self.close_message_menu(peer);
                 // The row keeps its place in the list but has nothing left to preview, and a chat
                 // with no messages has nothing left unread either.
                 self.dialogs.clear_preview(peer);
@@ -421,9 +507,15 @@ impl App {
             self.open_chat = None;
             self.viewer = None;
             self.compose.clear();
+            // A half-rewritten message must not be carried into whichever chat replaces this one —
+            // and its id, like the reply target's, would name a different message there anyway.
+            self.editing = None;
+            self.replying_to = None;
             self.focus = Focus::Chats;
             self.open_selected_chat();
         }
+        // The buffer went with the conversation, and the cursor with it.
+        self.close_message_menu(peer);
 
         match name {
             Some(name) => self.set_status(format!("{name} — {reason}"), StatusKind::Info),
@@ -521,10 +613,19 @@ impl App {
             return self.handle_viewer_key(key);
         }
 
+        // The picker takes plain characters into its filter, so it has to be claimed before either
+        // menu — and before the compose box, for the same reason they are.
+        if self.forward.is_some() {
+            return self.handle_forward_key(key);
+        }
+
         // The menu is modal too. Its keys are claimed before anything else, or `j`, `k`, `y` and
         // `n` would fall through into the compose box behind the popup.
         if self.menu.is_some() {
             return self.handle_menu_key(key);
+        }
+        if self.message_menu.is_some() {
+            return self.handle_message_menu_key(key);
         }
 
         if ctrl && key.code == KeyCode::Char('p') {
@@ -543,6 +644,19 @@ impl App {
         if ctrl && matches!(key.code, KeyCode::Char('e')) {
             return self.step_folder(false);
         }
+        // After the viewer for the same reason again: with a picture open the transcript is not
+        // drawn, so a cursor in it would be moving over something nobody can see. `Ctrl+S` is safe
+        // to claim because `ratatui::init` puts the terminal in raw mode, which clears `IXON` —
+        // nothing upstream is still reading it as XOFF.
+        if ctrl && matches!(key.code, KeyCode::Char('s')) {
+            return self.toggle_select_mode();
+        }
+
+        // The message cursor is modal in the same way the menu is: while it is on, `j`, `k` and
+        // `q` belong to it rather than to the compose box behind it.
+        if self.selecting() {
+            return self.handle_select_key(key);
+        }
 
         match key.code {
             KeyCode::Tab => {
@@ -550,6 +664,16 @@ impl App {
                     Focus::Chats => Focus::Messages,
                     Focus::Messages => Focus::Chats,
                 };
+                return;
+            }
+            // An abandoned edit or reply takes one `Esc` of its own before the next one leaves the
+            // pane, or backing out of either would also throw away the focus.
+            KeyCode::Esc if self.editing.is_some() => {
+                self.cancel_edit();
+                return;
+            }
+            KeyCode::Esc if self.replying_to.is_some() => {
+                self.cancel_reply();
                 return;
             }
             KeyCode::Esc if self.focus == Focus::Messages => {
@@ -799,6 +923,292 @@ impl App {
         self.set_status(action.in_progress(), StatusKind::Info);
     }
 
+    // -- the message cursor --------------------------------------------------
+
+    /// Whether the open chat has a cursor on it. There is no separate mode flag: `selected` being
+    /// `Some` *is* the mode, so the two can never disagree.
+    pub fn selecting(&self) -> bool {
+        self.open_buffer()
+            .is_some_and(|buffer| buffer.selected.is_some())
+    }
+
+    fn toggle_select_mode(&mut self) {
+        if self.selecting() {
+            return self.leave_select_mode();
+        }
+        let Some(buffer) = self.open_buffer_mut() else {
+            return;
+        };
+        if !buffer.select_newest() {
+            return self.set_status("no messages here", StatusKind::Info);
+        }
+        // The cursor lives in the transcript, so the transcript is what the keyboard is aimed at.
+        self.focus = Focus::Messages;
+        self.scroll_to_selection = true;
+    }
+
+    fn leave_select_mode(&mut self) {
+        if let Some(buffer) = self.open_buffer_mut() {
+            buffer.selected = None;
+        }
+    }
+
+    fn handle_select_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.leave_select_mode(),
+            KeyCode::Up | KeyCode::Char('k') => self.step_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.step_selection(1),
+            KeyCode::Enter => self.open_message_menu(),
+            KeyCode::Tab => {
+                self.leave_select_mode();
+                self.focus = Focus::Chats;
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the action menu on the message under the cursor.
+    ///
+    /// Which entries it offers depends on the conversation as well as the message, so the kind
+    /// comes off the dialog row rather than being re-derived from the peer id — `PeerKind` cannot
+    /// tell a broadcast channel from a megagroup, and those two delete differently.
+    fn open_message_menu(&mut self) {
+        let Some(buffer) = self.open_buffer() else {
+            return;
+        };
+        let (peer, Some(message_id)) = (buffer.peer, buffer.selected) else {
+            return;
+        };
+        let Some(outgoing) = buffer
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .map(|message| message.outgoing)
+        else {
+            return;
+        };
+        let Some(kind) = self.dialogs.find(peer.id).map(|item| item.kind) else {
+            return;
+        };
+
+        self.message_menu = Some(MessageMenu {
+            peer,
+            message_id,
+            actions: message_actions::actions_for(kind, outgoing),
+            selected: 0,
+            confirming: None,
+        });
+    }
+
+    /// Shut a message menu that is open on `peer`, whose messages have just gone.
+    fn close_message_menu(&mut self, peer: PeerId) {
+        if self
+            .message_menu
+            .as_ref()
+            .is_some_and(|menu| menu.peer.id == peer)
+        {
+            self.message_menu = None;
+        }
+    }
+
+    /// The same modal shape as [`App::handle_menu_key`], down to `Esc` meaning "no" rather than
+    /// "close" while a question is up.
+    fn handle_message_menu_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.message_menu.as_mut() else {
+            return;
+        };
+
+        if let Some(pending) = menu.confirming {
+            match key.code {
+                KeyCode::Char('y' | 'Y') => {
+                    menu.confirming = None;
+                    self.run_message_action(pending);
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => menu.confirming = None,
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.message_menu = None,
+            KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(menu.actions.len().saturating_sub(1));
+            }
+            KeyCode::Enter => match menu.action() {
+                Some(action) if action.is_destructive() => menu.confirming = Some(action),
+                Some(action) => self.run_message_action(action),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Carry out an action and close the menu.
+    ///
+    /// Unlike [`App::run_action`], not every entry here is a request: Reply and Edit only aim the
+    /// compose box at something, and Forward opens a second modal to ask where. Only the deletes
+    /// leave for the network, and those apply nothing locally — the reducer runs when the server
+    /// confirms, exactly as the chat actions do.
+    fn run_message_action(&mut self, action: MessageAction) {
+        let Some(menu) = self.message_menu.take() else {
+            return;
+        };
+        let (peer, id) = (menu.peer, menu.message_id);
+
+        match action {
+            MessageAction::DeleteForMe => self.send(TgCommand::DeleteMessages {
+                peer,
+                ids: vec![id],
+                revoke: false,
+            }),
+            MessageAction::DeleteForEveryone => self.send(TgCommand::DeleteMessages {
+                peer,
+                ids: vec![id],
+                revoke: true,
+            }),
+            MessageAction::Edit => self.start_edit(id),
+            MessageAction::Reply => self.start_reply(id),
+            MessageAction::Forward => {
+                self.forward = Some(ForwardPicker {
+                    source: peer,
+                    ids: vec![id],
+                    filter: String::new(),
+                    selected: 0,
+                });
+            }
+        }
+
+        if let Some(progress) = action.in_progress() {
+            self.set_status(progress, StatusKind::Info);
+        }
+    }
+
+    // -- the forward picker --------------------------------------------------
+
+    /// Rows the picker is offering, as indices into `dialogs.items`.
+    pub fn forward_matches(&self) -> Vec<usize> {
+        self.forward
+            .as_ref()
+            .map(|picker| self.dialogs.matching(&picker.filter))
+            .unwrap_or_default()
+    }
+
+    fn handle_forward_key(&mut self, key: KeyEvent) {
+        let matches = self.forward_matches();
+        let Some(picker) = self.forward.as_mut() else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc => self.forward = None,
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(matches.len().saturating_sub(1));
+            }
+            KeyCode::Enter => self.send_forward(),
+            KeyCode::Backspace => {
+                picker.filter.pop();
+                // Widening the filter cannot invalidate the selection, but it does change what it
+                // points at, so start again from the top rather than somewhere arbitrary.
+                picker.selected = 0;
+            }
+            KeyCode::Char(ch) => {
+                picker.filter.push(ch);
+                // Narrowing can leave `selected` past the end of a shorter list, and it indexes
+                // the filtered rows rather than the pool.
+                picker.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn send_forward(&mut self) {
+        let Some(&index) = self.forward_matches().get(
+            self.forward
+                .as_ref()
+                .map(|picker| picker.selected)
+                .unwrap_or(0),
+        ) else {
+            return;
+        };
+        let Some(destination) = self.dialogs.items.get(index).map(|item| item.peer) else {
+            return;
+        };
+        let name = self.dialogs.items[index].name.clone();
+        let Some(picker) = self.forward.take() else {
+            return;
+        };
+
+        self.send(TgCommand::ForwardMessages {
+            source: picker.source,
+            ids: picker.ids,
+            destination,
+        });
+        self.set_status(format!("forwarding to {name}…"), StatusKind::Info);
+    }
+
+    /// Load a message back into the compose box so it can be rewritten.
+    ///
+    /// `raw_text` rather than `text`: the transcript's version of a media message has the label
+    /// folded into it, and sending that back would write `[photo]` into the caption.
+    ///
+    /// The cursor goes away, because the keyboard is now aimed at the compose box and leaving a
+    /// highlight up would say otherwise.
+    fn start_edit(&mut self, id: i32) {
+        let Some(text) = self.open_buffer().and_then(|buffer| {
+            buffer
+                .messages
+                .iter()
+                .find(|message| message.id == id)
+                .map(|message| message.raw_text.clone())
+        }) else {
+            return;
+        };
+
+        self.compose = text;
+        self.editing = Some(id);
+        self.leave_select_mode();
+        self.focus = Focus::Messages;
+    }
+
+    /// Put the compose box back to writing a new message, keeping whatever is typed in it.
+    fn cancel_edit(&mut self) {
+        if self.editing.take().is_some() {
+            self.compose.clear();
+        }
+    }
+
+    /// Aim the next send at a message, so it threads under it.
+    ///
+    /// Whatever is half-typed stays: unlike an edit, a reply adds to what the box already holds
+    /// rather than replacing it, so throwing the text away would be losing work for nothing. An
+    /// edit in progress does go, because a message cannot be both rewritten and replied to.
+    fn start_reply(&mut self, id: i32) {
+        self.cancel_edit();
+        self.replying_to = Some(id);
+        self.leave_select_mode();
+        self.focus = Focus::Messages;
+    }
+
+    fn cancel_reply(&mut self) {
+        self.replying_to = None;
+    }
+
+    fn step_selection(&mut self, delta: isize) {
+        let Some(buffer) = self.open_buffer_mut() else {
+            return;
+        };
+        let at_oldest = buffer.select_step(delta);
+        self.scroll_to_selection = true;
+        // Walking off the top of what we hold is the same signal scrolling there is, and the
+        // guard in `load_older_if_needed` is what stops it queueing a second page.
+        if at_oldest {
+            self.load_older_if_needed();
+        }
+    }
+
     // -- the full-screen viewer ----------------------------------------------
 
     fn handle_viewer_key(&mut self, key: KeyEvent) {
@@ -903,6 +1313,13 @@ impl App {
             return;
         }
         self.open_chat = Some(peer.id);
+        // Both of these are message ids, and a message id means something different in every
+        // conversation. Carried across, they would aim the next Enter at whatever message happens
+        // to hold that id here — an edit or a reply landing on a message nobody pointed at. The
+        // compose *text* deliberately stays: that is the user's, and it follows them.
+        self.editing = None;
+        self.replying_to = None;
+        self.message_menu = None;
         // Local only, and deliberately so: tgtui never sends a read acknowledgement, so opening a
         // chat here must not change what the account's other clients — or the sender — see. The
         // badge is a note to ourselves about this session and nothing more. It has to be cleared
@@ -928,14 +1345,49 @@ impl App {
         let peer = buffer.peer;
 
         self.compose.clear();
-        self.send(TgCommand::SendMessage { peer, text });
+        let reply_to = self.replying_to.take();
+        // Nothing is applied locally either way. A sent message comes back as `MessageSent`; an
+        // edit comes back over the update stream and is replaced in place there.
+        match self.editing.take() {
+            Some(message_id) => {
+                self.send(TgCommand::EditMessage {
+                    peer,
+                    message_id,
+                    text,
+                });
+                self.set_status("editing…", StatusKind::Info);
+            }
+            None => self.send(TgCommand::SendMessage {
+                peer,
+                text,
+                reply_to,
+            }),
+        }
+    }
+
+    /// Ask for the parents of replies on screen whose parent is not in the buffer.
+    ///
+    /// Called from the renderer every frame, like [`App::request_visible_photos`], so the filtering
+    /// has to be the thing that stops it: `reply_requested` is set here and never cleared.
+    pub fn request_reply_targets(&mut self, ids: &[i32]) {
+        let Some(buffer) = self.open_buffer_mut() else {
+            return;
+        };
+        let wanted = buffer.unfetched_replies(ids);
+        if wanted.is_empty() {
+            return;
+        }
+        buffer.reply_requested.extend(wanted.iter().copied());
+        let peer = buffer.peer;
+
+        self.send(TgCommand::LoadReplyTargets { peer, ids: wanted });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::chat_buffer::PAGE_SIZE;
+    use crate::state::chat_buffer::{PAGE_SIZE, ReplyPreview};
     use crate::state::dialog_list::FolderTab;
     use crate::telegram::TgEvent;
     use crate::test_support::{
@@ -1205,7 +1657,7 @@ mod tests {
 
         let commands = drain(&mut rx);
         assert!(
-            matches!(commands.as_slice(), [TgCommand::SendMessage { text, peer: p }]
+            matches!(commands.as_slice(), [TgCommand::SendMessage { text, peer: p, reply_to: None }]
                 if text == "hi ther" && p.id == peer(1).id),
             "got {commands:?}"
         );
@@ -1943,6 +2395,817 @@ mod tests {
             "the server counts from its own read pointer, which tgtui never moves, so its number \
              can only ever be believed when it is the smaller one"
         );
+    }
+
+    // -- the message cursor --------------------------------------------------
+
+    /// The message the cursor is on in the open chat.
+    fn cursor(app: &App) -> Option<i32> {
+        app.open_buffer().and_then(|buffer| buffer.selected)
+    }
+
+    #[test]
+    fn ctrl_s_puts_the_cursor_on_the_newest_message_and_aims_the_keyboard_at_it() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        assert_eq!(cursor(&app), Some(100));
+        assert_eq!(app.focus, Focus::Messages);
+        assert!(
+            app.scroll_to_selection,
+            "the newest message is at the bottom, but the renderer still has to be told to check"
+        );
+    }
+
+    #[test]
+    fn ctrl_s_again_puts_the_cursor_away() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        assert_eq!(cursor(&app), None);
+        assert!(!app.selecting());
+    }
+
+    /// The whole reason the cursor is modal. With the transcript focused every plain character is
+    /// typed into the compose box, so `j` and `k` have to be claimed before they get there.
+    #[test]
+    fn select_mode_swallows_j_and_k_instead_of_typing_them() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        app.handle_key(key(KeyCode::Char('k')));
+        app.handle_key(key(KeyCode::Char('k')));
+        app.handle_key(key(KeyCode::Char('j')));
+
+        assert_eq!(cursor(&app), Some(99));
+        assert!(
+            app.compose.is_empty(),
+            "a cursor keystroke that reached the compose box would be typing into a message"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_move_the_cursor_rather_than_scrolling_while_it_is_up() {
+        let (mut app, _rx) = opened_chat();
+        let before = app.open_buffer().unwrap().scroll;
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        app.handle_key(key(KeyCode::Up));
+
+        assert_eq!(cursor(&app), Some(99));
+        assert_eq!(
+            app.open_buffer().unwrap().scroll,
+            before,
+            "the renderer moves the viewport to follow the cursor; the key handler must not also \
+             move it, or the two would fight"
+        );
+    }
+
+    #[test]
+    fn esc_leaves_select_mode_and_gives_the_keyboard_back_to_the_compose_box() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('j')));
+
+        assert_eq!(cursor(&app), None);
+        assert_eq!(app.compose, "j");
+    }
+
+    /// Same ranking as the action menu, and for the same reason: with a picture open the
+    /// transcript is not drawn at all, so a cursor moving through it would be invisible.
+    #[test]
+    fn the_viewer_outranks_the_message_cursor() {
+        let (mut app, _rx) = opened_chat();
+        app.open_buffer_mut().unwrap().messages[0] = photo_message(60, "look", 400, 300);
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        app.viewer = Some(60);
+
+        app.handle_key(key(KeyCode::Char('j')));
+
+        assert_eq!(
+            cursor(&app),
+            Some(100),
+            "the cursor must not have moved under a picture that is covering the transcript"
+        );
+    }
+
+    #[test]
+    fn walking_off_the_top_of_what_we_hold_asks_for_more_history() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        for _ in 0..PAGE_SIZE {
+            app.handle_key(key(KeyCode::Up));
+        }
+
+        assert_eq!(cursor(&app), Some(51), "the oldest message we hold");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|command| matches!(command, TgCommand::LoadOlderMessages { .. })),
+            "reaching the top with the cursor is the same signal as scrolling there"
+        );
+    }
+
+    #[test]
+    fn a_page_of_older_history_leaves_the_cursor_on_the_same_message() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Up));
+
+        app.handle_event(TgEvent::OlderMessagesLoaded {
+            peer: peer(1).id,
+            messages: page(50, PAGE_SIZE as i32),
+        });
+
+        assert_eq!(cursor(&app), Some(99));
+    }
+
+    #[test]
+    fn a_chat_with_nothing_in_it_says_so_rather_than_turning_the_mode_on() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_event(TgEvent::HistoryCleared { peer: peer(1).id });
+
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        assert!(!app.selecting());
+        assert!(app.status.is_some());
+    }
+
+    // -- the message action menu ---------------------------------------------
+
+    /// Put the cursor on `id` and open its menu. The cursor is placed directly rather than walked
+    /// there with `Ctrl+S` and arrows — that path has tests of its own above, and `Ctrl+S` toggles,
+    /// so a helper that pressed it would turn select mode *off* on its second call.
+    fn message_menu_on(app: &mut App, id: i32) {
+        app.open_buffer_mut()
+            .expect("a chat should be open")
+            .selected = Some(id);
+        app.handle_key(key(KeyCode::Enter));
+    }
+
+    fn message_menu_labels(app: &App) -> Vec<&'static str> {
+        app.message_menu
+            .as_ref()
+            .expect("the message menu should be open")
+            .actions
+            .iter()
+            .map(|action| action.label())
+            .collect()
+    }
+
+    /// Walk the message menu down to the entry with this label and press Enter.
+    fn pick_message_action(app: &mut App, label: &str) {
+        let menu = app.message_menu.as_ref().expect("the menu should be open");
+        let at = menu
+            .actions
+            .iter()
+            .position(|action| action.label() == label)
+            .unwrap_or_else(|| panic!("no {label:?} in {:?}", message_menu_labels(app)));
+        for _ in 0..at {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn enter_opens_the_menu_on_the_message_under_the_cursor() {
+        let (mut app, _rx) = opened_chat();
+
+        message_menu_on(&mut app, 99);
+
+        let menu = app.message_menu.as_ref().unwrap();
+        assert_eq!(menu.message_id, 99);
+        assert_eq!(menu.peer.id, peer(1).id);
+    }
+
+    /// The menu is built from the message *and* the conversation, so the fixture's incoming
+    /// messages in a private chat offer no Edit and no unsend.
+    #[test]
+    fn the_menu_reflects_whose_message_it_is() {
+        let (mut app, _rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        assert_eq!(
+            message_menu_labels(&app),
+            ["Reply", "Forward to…", "Delete for me"]
+        );
+
+        app.handle_key(key(KeyCode::Esc));
+        app.open_buffer_mut()
+            .unwrap()
+            .messages
+            .push_back(outgoing(101, "mine"));
+        message_menu_on(&mut app, 101);
+        assert_eq!(
+            message_menu_labels(&app),
+            [
+                "Reply",
+                "Edit",
+                "Forward to…",
+                "Delete for me",
+                "Delete for everyone",
+            ]
+        );
+    }
+
+    /// The same hazard the chat menu has: `j`, `k`, `y` and `n` are plain characters, and the
+    /// compose box is right behind the popup.
+    #[test]
+    fn the_message_menu_swallows_the_keys_it_uses() {
+        let (mut app, _rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('y')));
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert!(app.compose.is_empty());
+        assert_eq!(app.message_menu.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn a_delete_asks_before_it_goes_out() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+
+        pick_message_action(&mut app, "Delete for me");
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing may leave for the network before the question is answered"
+        );
+        assert_eq!(
+            app.message_menu.as_ref().unwrap().confirming,
+            Some(MessageAction::DeleteForMe)
+        );
+    }
+
+    #[test]
+    fn answering_yes_sends_the_delete_and_no_sends_nothing() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Delete for me");
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(drain(&mut rx).is_empty());
+        assert!(
+            app.message_menu.is_some(),
+            "no closes the question, not the menu"
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::DeleteMessages { ids, revoke: false, .. }] if ids == &[100]
+        ));
+        assert!(app.message_menu.is_none(), "yes closes the menu");
+    }
+
+    #[test]
+    fn unsending_asks_the_server_to_revoke() {
+        let (mut app, mut rx) = opened_chat();
+        app.open_buffer_mut()
+            .unwrap()
+            .messages
+            .push_back(outgoing(101, "oops"));
+        message_menu_on(&mut app, 101);
+
+        pick_message_action(&mut app, "Delete for everyone");
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::DeleteMessages { ids, revoke: true, .. }] if ids == &[101]
+        ));
+    }
+
+    /// Nothing is applied here — the transcript closes up when the server confirms, exactly as the
+    /// chat actions do. A delete that quietly failed but showed as deleted would be a lie about
+    /// what the account still holds.
+    #[test]
+    fn a_delete_leaves_the_transcript_alone_until_the_server_answers() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Delete for me");
+        app.handle_key(key(KeyCode::Char('y')));
+        drain(&mut rx);
+
+        assert!(
+            app.open_buffer()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.id == 100),
+            "the message must still be there while the request is in flight"
+        );
+
+        app.handle_event(TgEvent::MessagesDeleted {
+            channel: None,
+            ids: vec![100],
+        });
+
+        assert!(
+            !app.open_buffer()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.id == 100)
+        );
+        assert_eq!(
+            cursor(&app),
+            None,
+            "the cursor was on the message that went, so it goes too"
+        );
+    }
+
+    // -- forwarding ----------------------------------------------------------
+
+    fn type_into(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    /// Names the picker is currently offering.
+    fn forward_names(app: &App) -> Vec<String> {
+        app.forward_matches()
+            .into_iter()
+            .map(|index| app.dialogs.items[index].name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn forwarding_opens_a_picker_over_every_chat() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+
+        pick_message_action(&mut app, "Forward to…");
+
+        assert!(
+            app.message_menu.is_none(),
+            "the menu hands over to the picker"
+        );
+        assert_eq!(forward_names(&app), ["Alice", "Bob"]);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "nothing goes out until a destination is chosen"
+        );
+    }
+
+    /// The picker takes plain characters, so it has to be claimed ahead of the compose box and of
+    /// the menus that navigate with `j` and `k`.
+    #[test]
+    fn typing_in_the_picker_filters_rather_than_composing() {
+        let (mut app, _rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Forward to…");
+
+        type_into(&mut app, "bo");
+
+        assert_eq!(forward_names(&app), ["Bob"]);
+        assert!(app.compose.is_empty());
+    }
+
+    #[test]
+    fn the_filter_ignores_case_and_backspace_widens_it_again() {
+        let (mut app, _rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Forward to…");
+
+        type_into(&mut app, "ALIC");
+        assert_eq!(forward_names(&app), ["Alice"]);
+
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(forward_names(&app), ["Alice", "Bob"]);
+    }
+
+    /// `selected` indexes the filtered rows, so narrowing the list can leave it past the end.
+    #[test]
+    fn narrowing_the_filter_cannot_strand_the_selection() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Forward to…");
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.forward.as_ref().unwrap().selected, 1);
+
+        type_into(&mut app, "alice");
+        assert_eq!(
+            app.forward.as_ref().unwrap().selected,
+            0,
+            "row 1 no longer exists in a list of one"
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::ForwardMessages { destination, .. }] if destination.id == peer(1).id
+        ));
+    }
+
+    #[test]
+    fn enter_forwards_to_the_highlighted_chat() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Forward to…");
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::ForwardMessages { source, ids, destination }]
+                if source.id == peer(1).id && ids == &[100] && destination.id == peer(2).id
+        ));
+        assert!(app.forward.is_none());
+    }
+
+    #[test]
+    fn esc_cancels_a_forward_without_sending_anything() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Forward to…");
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.forward.is_none());
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_forwards_nothing() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Forward to…");
+
+        type_into(&mut app, "nobody");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(drain(&mut rx).is_empty());
+        assert!(
+            app.forward.is_some(),
+            "Enter with nothing to pick must leave the picker up rather than closing silently"
+        );
+    }
+
+    /// The picker searches the whole pool, not the folder on screen: where you want to send
+    /// something has nothing to do with which tab you happen to be reading.
+    #[test]
+    fn the_picker_reaches_chats_the_current_folder_does_not_show() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_event(TgEvent::DialogsLoaded {
+            items: vec![archived_dialog(3, "Carol")],
+            exhausted: true,
+            archived: true,
+        });
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Forward to…");
+
+        type_into(&mut app, "carol");
+
+        assert_eq!(
+            forward_names(&app),
+            ["Carol"],
+            "an archived chat is still somewhere you can forward to"
+        );
+    }
+
+    // -- replying ------------------------------------------------------------
+
+    #[test]
+    fn replying_threads_the_next_message_under_the_one_picked() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Reply");
+
+        assert_eq!(app.replying_to, Some(100));
+        assert!(!app.selecting());
+
+        for ch in "on my way".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::SendMessage { text, reply_to: Some(100), .. }] if text == "on my way"
+        ));
+        assert_eq!(
+            app.replying_to, None,
+            "the thread ends with the message that used it"
+        );
+    }
+
+    /// Unlike an edit, a reply adds to what the box already holds rather than replacing it.
+    #[test]
+    fn starting_a_reply_keeps_what_is_already_typed() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_key(key(KeyCode::Tab));
+        for ch in "yes".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Reply");
+
+        assert_eq!(app.compose, "yes");
+    }
+
+    /// A message cannot be both rewritten and replied to, so picking one ends the other.
+    #[test]
+    fn replying_abandons_an_edit_in_progress() {
+        let (mut app, _rx) = editing("teh typo");
+
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Reply");
+
+        assert_eq!(app.editing, None);
+        assert_eq!(app.replying_to, Some(100));
+        assert!(
+            app.compose.is_empty(),
+            "the edit's text was the message's, not the user's"
+        );
+    }
+
+    #[test]
+    fn esc_cancels_a_reply_before_it_leaves_the_pane() {
+        let (mut app, mut rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Reply");
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.replying_to, None);
+        assert_eq!(app.focus, Focus::Messages);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_parent_on_screen_is_fetched_once_and_not_again() {
+        let (mut app, mut rx) = opened_chat();
+
+        app.request_reply_targets(&[7, 7, 8]);
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::LoadReplyTargets { ids, .. }] if ids == &[7, 8]
+        ));
+
+        app.request_reply_targets(&[7, 8]);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the renderer asks again every frame; the guard is what stops it"
+        );
+    }
+
+    /// A parent that has been deleted comes back as nothing at all. The guard must hold for it
+    /// too, or the very next frame asks for it again — the same terminal shape as a failed photo.
+    #[test]
+    fn a_parent_the_server_cannot_find_stops_being_asked_for() {
+        let (mut app, mut rx) = opened_chat();
+        app.request_reply_targets(&[7]);
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::ReplyTargetsLoaded {
+            peer: peer(1).id,
+            asked: vec![7],
+            targets: Vec::new(),
+        });
+
+        app.request_reply_targets(&[7]);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_fetched_parent_becomes_the_quote_for_every_reply_to_it() {
+        let (mut app, _rx) = opened_chat();
+
+        app.handle_event(TgEvent::ReplyTargetsLoaded {
+            peer: peer(1).id,
+            asked: vec![7],
+            targets: vec![(
+                7,
+                ReplyPreview {
+                    sender: Some("Bob".to_string()),
+                    text: "where should we meet?".to_string(),
+                },
+            )],
+        });
+
+        let preview = app.open_buffer().unwrap().reply_preview(7).unwrap();
+        assert_eq!(preview.text, "where should we meet?");
+        assert_eq!(preview.sender.as_deref(), Some("Bob"));
+    }
+
+    /// A message already in the buffer needs no round trip to be quoted.
+    #[test]
+    fn a_parent_in_the_buffer_is_read_straight_out_of_it() {
+        let (app, _rx) = opened_chat();
+
+        let preview = app.open_buffer().unwrap().reply_preview(100).unwrap();
+        assert_eq!(preview.text, "message 100");
+    }
+
+    // -- editing -------------------------------------------------------------
+
+    /// Put an outgoing message in the buffer and start editing it.
+    fn editing(text: &str) -> (App, mpsc::UnboundedReceiver<TgCommand>) {
+        let (mut app, mut rx) = opened_chat();
+        app.open_buffer_mut()
+            .unwrap()
+            .messages
+            .push_back(outgoing(101, text));
+        message_menu_on(&mut app, 101);
+        pick_message_action(&mut app, "Edit");
+        drain(&mut rx);
+        (app, rx)
+    }
+
+    #[test]
+    fn editing_loads_the_message_back_into_the_compose_box() {
+        let (app, _rx) = editing("teh typo");
+
+        assert_eq!(app.compose, "teh typo");
+        assert_eq!(app.editing, Some(101));
+        assert!(
+            !app.selecting(),
+            "the keyboard is aimed at the compose box now, so a highlight would say otherwise"
+        );
+    }
+
+    /// The transcript's copy of a media message has the label folded into it. Sending that back
+    /// would write `[file]` into the caption.
+    #[test]
+    fn editing_a_media_message_offers_its_caption_rather_than_the_label() {
+        let (mut app, _rx) = opened_chat();
+        let mut media = outgoing(101, "here you go");
+        media.text = "[file] here you go".to_string();
+        app.open_buffer_mut().unwrap().messages.push_back(media);
+
+        message_menu_on(&mut app, 101);
+        pick_message_action(&mut app, "Edit");
+
+        assert_eq!(
+            app.compose, "here you go",
+            "the label is the transcript's, not the message's"
+        );
+    }
+
+    #[test]
+    fn enter_sends_an_edit_rather_than_a_new_message_while_one_is_loaded() {
+        let (mut app, mut rx) = editing("teh typo");
+
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::EditMessage { message_id: 101, text, .. }] if text == "teh typ"
+        ));
+        assert_eq!(
+            app.editing, None,
+            "the box goes back to writing new messages"
+        );
+        assert!(app.compose.is_empty());
+    }
+
+    #[test]
+    fn esc_abandons_an_edit_before_it_leaves_the_pane() {
+        let (mut app, mut rx) = editing("teh typo");
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.editing, None);
+        assert!(app.compose.is_empty());
+        assert_eq!(
+            app.focus,
+            Focus::Messages,
+            "the first Esc cancels the edit; leaving the pane takes a second one"
+        );
+        assert!(drain(&mut rx).is_empty());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Chats);
+    }
+
+    /// Nothing is applied locally. The new text arrives over the update stream, through the arm
+    /// that already existed for edits made on another device.
+    #[test]
+    fn an_edit_reaches_the_transcript_through_the_update_stream() {
+        let (mut app, mut rx) = editing("teh typo");
+        app.handle_key(key(KeyCode::Enter));
+        drain(&mut rx);
+
+        assert_eq!(
+            app.open_buffer().unwrap().messages.back().unwrap().text,
+            "teh typo",
+            "the transcript must not change on the strength of a request that may still fail"
+        );
+
+        app.handle_event(TgEvent::IncomingMessage {
+            peer: peer(1),
+            message: outgoing(101, "the typo"),
+            edited: true,
+        });
+
+        assert_eq!(
+            app.open_buffer().unwrap().messages.back().unwrap().text,
+            "the typo"
+        );
+    }
+
+    /// Walk from Alice to Bob with the chat list.
+    fn walk_to_the_next_chat(app: &mut App) {
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down));
+    }
+
+    /// A message id means something different in every conversation, so carrying one across would
+    /// aim the next Enter at whatever message happens to hold that id in the new chat.
+    #[test]
+    fn walking_to_another_chat_abandons_a_pending_reply() {
+        let (mut app, _rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+        pick_message_action(&mut app, "Reply");
+
+        walk_to_the_next_chat(&mut app);
+
+        assert_eq!(app.open_chat, Some(peer(2).id));
+        assert_eq!(
+            app.replying_to, None,
+            "id 100 in Bob's chat is a different message entirely"
+        );
+    }
+
+    #[test]
+    fn walking_to_another_chat_abandons_a_pending_edit() {
+        let (mut app, _rx) = editing("teh typo");
+
+        walk_to_the_next_chat(&mut app);
+
+        assert_eq!(app.open_chat, Some(peer(2).id));
+        assert_eq!(app.editing, None);
+    }
+
+    /// The text is the user's, unlike the ids beside it.
+    #[test]
+    fn walking_to_another_chat_keeps_what_is_typed() {
+        let (mut app, _rx) = opened_chat();
+        app.handle_key(key(KeyCode::Tab));
+        type_into(&mut app, "half a thought");
+
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down));
+
+        assert_eq!(app.compose, "half a thought");
+    }
+
+    #[test]
+    fn switching_chats_abandons_a_pending_edit() {
+        let (mut app, _rx) = editing("half rewritten");
+
+        app.handle_event(TgEvent::DialogGone {
+            peer: peer(1).id,
+            reason: "deleted",
+        });
+
+        assert_eq!(
+            app.editing, None,
+            "the id names a message in a chat that is gone; in the next one it would name another"
+        );
+        assert!(app.compose.is_empty());
+    }
+
+    #[test]
+    fn losing_the_conversation_shuts_a_menu_open_over_it() {
+        let (mut app, _rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+
+        app.handle_event(TgEvent::DialogGone {
+            peer: peer(1).id,
+            reason: "deleted",
+        });
+
+        assert!(app.message_menu.is_none());
+    }
+
+    #[test]
+    fn clearing_the_history_shuts_a_menu_open_over_it() {
+        let (mut app, _rx) = opened_chat();
+        message_menu_on(&mut app, 100);
+
+        app.handle_event(TgEvent::HistoryCleared { peer: peer(1).id });
+
+        assert!(app.message_menu.is_none());
     }
 
     // -- the chat action menu ------------------------------------------------

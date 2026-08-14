@@ -2,6 +2,7 @@
 
 pub mod chat_list;
 pub mod chat_view;
+pub mod forward_picker;
 pub mod images;
 pub mod login;
 pub mod menu;
@@ -34,11 +35,18 @@ pub fn draw(frame: &mut Frame, app: &mut App, images: &mut ImageStore) {
             chat_list::render(frame, list_area, app);
             chat_view::render(frame, chat_area, app, images);
 
-            // Last, and over the whole body: the menu floats, and the list underneath is the
-            // context for what it is about to do.
+            // Last, and over the whole body: a menu floats, and the pane underneath is the
+            // context for what it is about to do. Only one can be open at a time — `handle_main_key`
+            // routes every key to whichever it is — so the order between them never shows.
             if let Some(menu) = &app.menu {
-                menu::render(frame, body, menu);
+                menu::render(frame, body, &menu::chat(menu));
             }
+            if let Some(menu) = &app.message_menu {
+                menu::render(frame, body, &menu::message(menu));
+            }
+            // Over both: by the time it is up, the menu that opened it has closed, and it is the
+            // one the keyboard is aimed at.
+            forward_picker::render(frame, body, app);
         }
         _ => login::render(frame, body, app),
     }
@@ -60,6 +68,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if matches!(app.screen, Screen::Main) {
         let hints = if app.viewer.is_some() {
             " ←/→ previous/next picture · Esc close"
+        } else if app.forward.is_some() {
+            " type to search · ↑/↓ select · Enter forward · Esc cancel"
         } else if let Some(menu) = &app.menu {
             // While a question is up the only two keys that do anything are `y` and `n`, so
             // offering the menu's own keys here would be a lie.
@@ -68,13 +78,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 " ↑/↓ select · Enter do it · Esc close"
             }
+        } else if let Some(menu) = &app.message_menu {
+            if menu.confirming.is_some() {
+                " y confirm · n cancel"
+            } else {
+                " ↑/↓ select · Enter do it · Esc close"
+            }
+        } else if app.selecting() {
+            " ↑/↓ message · Enter actions · Esc back to writing"
         } else {
             match app.focus {
                 Focus::Chats => {
                     " ↑/↓ select · Enter open · Ctrl+O/E folder · Ctrl+A actions · Tab compose · Ctrl+C quit"
                 }
                 Focus::Messages => {
-                    " type to write · Enter send · ↑/↓ scroll · Ctrl+P picture · Ctrl+A actions · Tab/Esc back"
+                    " type to write · Enter send · Ctrl+S pick a message · Ctrl+P picture · Ctrl+A actions · Tab/Esc back"
                 }
             }
         };
@@ -490,6 +508,117 @@ mod tests {
             .unwrap_or_default();
         assert!(row.contains('~'), "no mute marker on the row: {row:?}");
         assert!(row.contains('^'), "no pin marker on the row: {row:?}");
+    }
+
+    /// Open the message cursor's menu on the newest message and pick an entry by label.
+    fn with_message_action(app: &mut App, label: &str) -> String {
+        painted(app, 80, 24);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+
+        let menu = app.message_menu.as_ref().expect("the menu should be open");
+        let at = menu
+            .actions
+            .iter()
+            .position(|action| action.label() == label)
+            .expect("no such entry");
+        for _ in 0..at {
+            app.handle_key(key(crossterm::event::KeyCode::Down));
+        }
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+
+        painted(app, 80, 24)
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    #[test]
+    fn the_message_menu_floats_over_the_transcript() {
+        let mut app = loaded_app();
+        painted(&mut app, 80, 24);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+
+        let screen = painted(&mut app, 80, 24);
+
+        assert!(screen.contains("Reply"), "the menu is missing:\n{screen}");
+        assert!(screen.contains("Forward"), "{screen}");
+        assert!(
+            screen.contains("Alice"),
+            "the pane underneath is the context for the action:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_forward_picker_lists_the_chats_it_can_send_to() {
+        let mut app = loaded_app();
+
+        let screen = with_message_action(&mut app, "Forward to…");
+
+        assert!(
+            screen.contains("Forward to"),
+            "the picker's title is missing:\n{screen}"
+        );
+        assert!(screen.contains("type to search"), "{screen}");
+        assert!(screen.contains("Bob"), "{screen}");
+        assert!(
+            screen.contains("Enter forward"),
+            "the footer must say how to send:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_forward_picker_says_when_nothing_matches() {
+        let mut app = loaded_app();
+        with_message_action(&mut app, "Forward to…");
+        for ch in "zzz".chars() {
+            app.handle_key(key(crossterm::event::KeyCode::Char(ch)));
+        }
+
+        let screen = painted(&mut app, 80, 24);
+
+        assert!(screen.contains("no chat by that name"), "{screen}");
+    }
+
+    #[test]
+    fn the_forward_picker_does_not_panic_in_a_terminal_with_no_room() {
+        let mut app = loaded_app();
+        with_message_action(&mut app, "Forward to…");
+
+        for (width, height) in [(20, 5), (40, 3), (200, 60), (10, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut images = ImageStore::disabled();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut images))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_message_menu_does_not_panic_in_a_terminal_with_no_room() {
+        let mut app = loaded_app();
+        painted(&mut app, 80, 24);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+
+        for (width, height) in [(20, 5), (40, 3), (200, 60), (10, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut images = ImageStore::disabled();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut images))
+                .unwrap();
+        }
     }
 
     #[test]

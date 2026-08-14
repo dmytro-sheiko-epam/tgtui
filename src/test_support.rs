@@ -38,8 +38,10 @@ pub fn message(id: i32, text: &str) -> ChatMessage {
         outgoing: false,
         sender: Some("Alice".to_string()),
         text: text.to_string(),
+        raw_text: text.to_string(),
         date: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         photo: None,
+        reply_to: None,
     }
 }
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use grammers_session::types::{PeerId, PeerRef};
 use image::DynamicImage;
 
-use crate::state::chat_buffer::ChatMessage;
+use crate::state::chat_buffer::{ChatMessage, ReplyPreview};
 use crate::state::dialog_list::DialogSummary;
 use crate::state::folders::Folder;
 
@@ -60,6 +60,23 @@ pub enum TgEvent {
     MessageSent {
         peer: PeerId,
         message: ChatMessage,
+    },
+    /// An edit was accepted. Banner only, and so payload-free: the new text arrives separately as
+    /// `updateEditMessage`, which `IncomingMessage { edited: true }` already applies in place.
+    MessageEdited,
+    /// Messages arrived in another conversation. The copies themselves come over the update
+    /// stream like any other new message, so this only names where they went.
+    MessagesForwarded {
+        destination: PeerId,
+    },
+    /// Parents of replies, for the quote line above them.
+    ///
+    /// Carries the ids that were *asked* for as well as the ones that came back, because a parent
+    /// that has been deleted comes back as nothing at all and still has to stop being asked for.
+    ReplyTargetsLoaded {
+        peer: PeerId,
+        asked: Vec<i32>,
+        targets: Vec<(i32, ReplyPreview)>,
     },
     /// Messages were deleted. `channel` is `Some` only for channel deletions — Telegram sends
     /// bare ids for users and small groups.

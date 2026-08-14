@@ -473,6 +473,20 @@ impl DialogListState {
         self.items.iter().find(|item| item.peer.id == peer_id)
     }
 
+    /// Rows whose name contains `filter`, case-insensitively.
+    ///
+    /// Deliberately over `items` rather than [`Self::visible`]: this backs the forward picker, and
+    /// which folder happens to be on screen has nothing to do with where the user wants to send
+    /// something. An archived chat is still somewhere you can forward to.
+    pub fn matching(&self, filter: &str) -> Vec<usize> {
+        let needle = filter.trim().to_lowercase();
+        (0..self.items.len())
+            .filter(|&index| {
+                needle.is_empty() || self.items[index].name.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
     /// Fold a page into the pool.
     ///
     /// Deduped by peer, because the two cursors overlap: the main fetch asks for every folder at

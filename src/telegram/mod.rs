@@ -14,6 +14,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use color_eyre::eyre::{Result, eyre};
 use grammers_client::client::{DialogIter, LoginToken, PasswordToken, UpdatesConfiguration};
+use grammers_client::message::InputMessage;
 use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client, InvocationError, SenderPool, SignInError};
@@ -26,7 +27,7 @@ pub use commands::TgCommand;
 pub use events::TgEvent;
 
 use crate::config::Config;
-use crate::state::chat_buffer::{self, ChatMessage};
+use crate::state::chat_buffer::{self, ChatMessage, ReplyPreview};
 use crate::state::dialog_list::{self, DialogSummary};
 use crate::state::folders::Folder;
 use crate::state::media::{self, PhotoSource};
@@ -136,7 +137,26 @@ async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCo
                 message_id,
                 source,
             } => actor.download_photo(peer, message_id, source),
-            TgCommand::SendMessage { peer, text } => actor.send_message(peer, text),
+            TgCommand::SendMessage {
+                peer,
+                text,
+                reply_to,
+            } => actor.send_message(peer, text, reply_to),
+            TgCommand::LoadReplyTargets { peer, ids } => actor.load_reply_targets(peer, ids),
+
+            TgCommand::DeleteMessages { peer, ids, revoke } => {
+                actor.delete_messages(peer, ids, revoke)
+            }
+            TgCommand::EditMessage {
+                peer,
+                message_id,
+                text,
+            } => actor.edit_message(peer, message_id, text),
+            TgCommand::ForwardMessages {
+                source,
+                ids,
+                destination,
+            } => actor.forward_messages(source, ids, destination),
 
             TgCommand::SetMuted { peer, muted } => actor.set_muted(peer, muted),
             TgCommand::SetPinned { peer, pinned } => actor.set_pinned(peer, pinned),
@@ -470,12 +490,16 @@ impl Actor {
         });
     }
 
-    fn send_message(&mut self, peer: grammers_session::types::PeerRef, text: String) {
+    fn send_message(&mut self, peer: PeerRef, text: String, reply_to: Option<i32>) {
         let client = self.client.clone();
         let events = self.events.clone();
 
+        // `reply_to` is a bare message id — quoting part of the parent, or replying across to
+        // another topic, would need `InputReplyTo`, which this does not build.
+        let message = InputMessage::new().text(text.as_str()).reply_to(reply_to);
+
         tokio::spawn(async move {
-            match client.send_message(peer, text.as_str()).await {
+            match client.send_message(peer, message).await {
                 Ok(message) => {
                     let _ = events.send(TgEvent::MessageSent {
                         peer: peer.id,
@@ -487,6 +511,111 @@ impl Actor {
                 }
             }
         });
+    }
+
+    /// Fetch the parents of replies on screen, for the line quoted above them.
+    ///
+    /// `get_messages_by_id` answers index-aligned with the request and puts `None` where a message
+    /// is gone. Those gaps are simply left out of `targets`; `asked` is what tells `App` to stop
+    /// requesting them. A failed request reports an empty answer for the same reason
+    /// `OlderMessagesLoaded` does — the guard has to clear either way, and here it must *stay* set.
+    fn load_reply_targets(&mut self, peer: PeerRef, ids: Vec<i32>) {
+        let client = self.client.clone();
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            let fetched = client.get_messages_by_id(peer, &ids).await;
+            if let Err(err) = &fetched {
+                tracing::debug!("could not fetch reply targets: {err}");
+            }
+
+            let targets = fetched
+                .unwrap_or_default()
+                .iter()
+                .flatten()
+                .map(|message| {
+                    let flattened = ChatMessage::from_grammers(message);
+                    (flattened.id, ReplyPreview::of(&flattened))
+                })
+                .collect();
+
+            let _ = events.send(TgEvent::ReplyTargetsLoaded {
+                peer: peer.id,
+                asked: ids,
+                targets,
+            });
+        });
+    }
+
+    // -- message actions -----------------------------------------------------
+
+    /// Remove messages, from our copy of the chat or from everybody's.
+    ///
+    /// `revoke: true` is grammers' own `delete_messages`, which hardcodes exactly that flag.
+    /// `revoke: false` has no high-level equivalent and is raw — and it is only ever asked for on
+    /// a peer `messages.deleteMessages` accepts, because `channels.deleteMessages` has no such
+    /// flag and always deletes for everyone. `actions_for` is what keeps that promise.
+    ///
+    /// The success event is emitted here rather than left to `updateDeleteMessages`, so the
+    /// transcript closes up even if the update is slow. `ChatBuffer::remove` retains, so the echo
+    /// arriving as well is harmless.
+    fn delete_messages(&mut self, peer: PeerRef, ids: Vec<i32>, revoke: bool) {
+        let channel = (peer.id.kind() == PeerKind::Channel).then_some(peer.id);
+        let success = TgEvent::MessagesDeleted {
+            channel,
+            ids: ids.clone(),
+        };
+
+        if revoke {
+            return self.act(
+                "delete this message".to_string(),
+                success,
+                move |client| async move { client.delete_messages(peer, &ids).await.map(drop) },
+            );
+        }
+
+        let request = tl::functions::messages::DeleteMessages {
+            revoke: false,
+            id: ids,
+        };
+        self.act(
+            "delete this message".to_string(),
+            success,
+            move |client| async move { client.invoke(&request).await.map(drop) },
+        );
+    }
+
+    /// Replace one of our own messages' text.
+    ///
+    /// grammers throws away the `Updates` this returns, which is fine here: the same edit arrives
+    /// on the update stream as `updateEditMessage`, and `App` already replaces the message in place
+    /// when it does — keeping any picture it had decoded. So this event is only for the banner.
+    fn edit_message(&mut self, peer: PeerRef, message_id: i32, text: String) {
+        self.act(
+            "edit this message".to_string(),
+            TgEvent::MessageEdited,
+            move |client| async move { client.edit_message(peer, message_id, text.as_str()).await },
+        );
+    }
+
+    /// Copy messages into another conversation.
+    ///
+    /// The forwarded copies are not applied here: they are ordinary new messages in the
+    /// destination and arrive over the update stream, which already appends them and bumps that
+    /// chat's row. So the event only says where they went, for the banner.
+    fn forward_messages(&mut self, source: PeerRef, ids: Vec<i32>, destination: PeerRef) {
+        self.act(
+            "forward this message".to_string(),
+            TgEvent::MessagesForwarded {
+                destination: destination.id,
+            },
+            move |client| async move {
+                client
+                    .forward_messages(destination, &ids, source)
+                    .await
+                    .map(drop)
+            },
+        );
     }
 
     // -- chat actions --------------------------------------------------------

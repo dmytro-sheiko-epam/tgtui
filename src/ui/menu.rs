@@ -8,11 +8,15 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::ChatMenu;
+use crate::app::{ChatMenu, MessageMenu};
 use crate::ui::text::wrap;
 use crate::ui::widgets::{centered, pane};
 
 /// Columns the popup wants around its widest label: two borders and a space either side.
+///
+/// Labels are measured in characters rather than bytes — "Forward to…" ends in a three-byte
+/// ellipsis, and a byte count would size the box for a label three columns wider than the one
+/// being drawn.
 const CHROME: u16 = 4;
 
 /// A floor, so a menu of short labels still reads as a menu rather than a sliver.
@@ -21,35 +25,75 @@ const MIN_WIDTH: u16 = 24;
 /// How wide the confirmation asks to be. Questions name a chat and run longer than labels do.
 const CONFIRM_WIDTH: u16 = 54;
 
-pub fn render(frame: &mut Frame, area: Rect, menu: &ChatMenu) {
-    match menu.prompt() {
-        Some(prompt) => render_confirm(frame, area, &prompt),
+/// A menu reduced to what drawing one needs.
+///
+/// Both menus are the same popup — a titled list, some entries in red, and a `y`/`n` box in front
+/// of it — so they share the drawing rather than the shape of their state. Which is also why
+/// `MessageAction::label` needs no argument and `DialogAction::label` does: the difference between
+/// them stops here.
+pub struct MenuView<'a> {
+    title: &'a str,
+    /// Each entry's label and whether it is one of the ones that asks before it runs.
+    entries: Vec<(&'static str, bool)>,
+    selected: usize,
+    prompt: Option<String>,
+}
+
+pub fn chat(menu: &ChatMenu) -> MenuView<'_> {
+    MenuView {
+        title: &menu.name,
+        entries: menu
+            .actions
+            .iter()
+            .map(|action| (action.label(menu.kind), action.is_destructive()))
+            .collect(),
+        selected: menu.selected,
+        prompt: menu.prompt(),
+    }
+}
+
+pub fn message(menu: &MessageMenu) -> MenuView<'static> {
+    MenuView {
+        title: "Message",
+        entries: menu
+            .actions
+            .iter()
+            .map(|action| (action.label(), action.is_destructive()))
+            .collect(),
+        selected: menu.selected,
+        prompt: menu.prompt(),
+    }
+}
+
+pub fn render(frame: &mut Frame, area: Rect, menu: &MenuView) {
+    match &menu.prompt {
+        Some(prompt) => render_confirm(frame, area, prompt),
         None => render_actions(frame, area, menu),
     }
 }
 
-fn render_actions(frame: &mut Frame, area: Rect, menu: &ChatMenu) {
-    let labels: Vec<&str> = menu
-        .actions
-        .iter()
-        .map(|action| action.label(menu.kind))
-        .collect();
+fn render_actions(frame: &mut Frame, area: Rect, menu: &MenuView) {
+    let labels: Vec<&str> = menu.entries.iter().map(|(label, _)| *label).collect();
 
-    let widest = labels.iter().map(|label| label.len()).max().unwrap_or(0) as u16;
+    let widest = labels
+        .iter()
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
     let popup = centered(
         area,
         widest.saturating_add(CHROME).max(MIN_WIDTH),
         labels.len() as u16 + 2,
     );
 
-    let block = pane(&menu.name, true);
-    let items: Vec<ListItem> = labels
-        .into_iter()
-        .zip(&menu.actions)
-        .map(|(label, action)| {
+    let block = pane(menu.title, true);
+    let items: Vec<ListItem> = menu
+        .entries
+        .iter()
+        .map(|(label, destructive)| {
             // The ones that ask before they run are also the ones worth hesitating over, so they
             // are the ones that look different.
-            let style = if action.is_destructive() {
+            let style = if *destructive {
                 Style::default().fg(Color::Red)
             } else {
                 Style::default()

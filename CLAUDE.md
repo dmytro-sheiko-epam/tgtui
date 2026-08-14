@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-cargo test                                  # whole suite (224 tests, all unit tests inside src/)
+cargo test                                  # whole suite (301 tests, all unit tests inside src/)
 cargo test scrolling_near_the_top           # one test by substring of its name
 cargo test app::tests                       # one module's tests
 cargo clippy --all-targets
@@ -54,7 +54,9 @@ Telegram events ├─> event::run (select! loop) ─> App (sync reducers) ─> 
 
 When adding a feature that talks to Telegram, the shape is always: new `TgCommand` variant →
 actor arm → new `TgEvent` variant → `App::handle_event` arm → render. Don't reach for the client
-from `App`.
+from `App`. Two of the message actions are shorter than that: an edit and a delete already have
+inbound halves (`Update::MessageEdited` and `Update::MessageDeleted`), so they need no new event
+beyond one for the status banner.
 
 ### Invariants worth knowing before editing
 
@@ -150,6 +152,51 @@ from `App`.
   behind the popup. `Ctrl+A` is checked after the viewer, because with a picture open the chat list
   is not drawn and a menu over it would act on something invisible. While a confirmation is
   pending `Esc` means "no" rather than "close".
+- **The message cursor is an id, not an index.** `ChatBuffer.selected` holds a message id, because
+  `prepend_older` shifts every index by a whole page and `remove` shifts them by however many went
+  — an index would silently come to mean a different message. `Some` *is* select mode; there is no
+  second flag that could disagree with it. `remove` clears it when the selected message is among
+  the dead, and `set_initial`/`clear` clear it too: a cursor pointing at nothing would be a mode
+  with nothing on screen to show for it.
+- **The highlight may restyle rows but never add or remove one.** `build_transcript` draws the
+  message normally and only then pads and restyles the rows it produced, which is what makes the
+  cursor provably free of line accounting. `scroll` and `metrics.total_lines` are denominated in
+  lines, and the cursor moves on every keystroke, so a highlight that cost a row would drift the
+  viewport continuously. A photo's reserved rows are painted over by `SlicedImage` afterwards, so
+  on a picture the highlight only shows on the caption or receipt line below it.
+- **Scrolling the cursor into view belongs to the renderer.** The cursor steps in messages while
+  the viewport moves in lines, and only the transcript just built knows which rows a message
+  covers. `App` sets `scroll_to_selection` and `render_transcript` consumes it — the same direction
+  `metrics` and the clamped `scroll` already flow. `event::run` draws after handling keys, so the
+  correction lands in the frame the user sees rather than the one after.
+- **A reply quote claims its row before the parent arrives.** `chat_view::quote_line` returns
+  exactly one line whether the parent is in the buffer, still being fetched, or gone for good —
+  a placeholder and a resolved quote are the same height. If the count changed when the fetch
+  landed, the viewport would jump under the reader at an arbitrary moment. Same discipline as
+  `ImageStore::reserve` and `prepare` sharing `fit`, and the same visibility-driven fetch as
+  photos: `ChatBuffer.reply_requested` is set when the request goes out and *never* cleared,
+  including for a parent the server says is gone, because the trigger fires again on the very next
+  frame.
+- **A message id must not outlive the chat it came from.** `App.editing` and `App.replying_to` are
+  message ids, and ids repeat across conversations — so `open_selected_chat` clears both (and any
+  open message menu) whenever `open_chat` actually changes, as `forget_dialog` does when the chat
+  goes entirely. Carried across, they would aim the next Enter at whatever message happened to
+  hold that id in the new chat. `compose` deliberately does *not* clear on a plain switch: the text
+  is the user's and follows them, unlike the ids beside it.
+- **`ChatMessage.text` is lossy and `raw_text` is not.** `from_grammers` flattens media labels and
+  service actions into `text` so the transcript can print one string. That is one-way, so an edit
+  reads `raw_text` — sending `text` back would write `[photo]` into the caption.
+- **Message actions apply nothing optimistically either.** Same rule as the chat actions, for the
+  same reason. A delete waits for `MessagesDeleted`; an edit's new text arrives over the update
+  stream and lands in the `IncomingMessage { edited: true }` arm that already existed for edits
+  made on another device. Unlike the chat menu, though, not every entry is a request: Reply and
+  Edit only aim the compose box, and Forward opens a second modal — so
+  `MessageAction::in_progress` returns an `Option`.
+- **The forward picker searches the pool, not the folder on screen.** `DialogListState::matching`
+  runs over `items` rather than `visible()`: which tab you happen to be reading has nothing to do
+  with where you want to send something, and an archived chat is still a destination. Its
+  `selected` indexes the *filtered* rows, so it resets to 0 on every keystroke — narrowing would
+  otherwise leave it past the end.
 - **The tick column is reserved, not conditional.** Outgoing bodies wrap `TICK_GUTTER` columns
   short whether or not the message has been read, so a receipt changing from ✓ to ✓✓ cannot change
   a message's line count and therefore cannot move `scroll` under the reader. Same discipline as
@@ -157,12 +204,25 @@ from `App`.
 
 ## Scope
 
-Reading and sending plain text, and **displaying** pictures inline: photos, image documents,
+Reading and sending plain text, acting on individual messages (reply, edit, delete, forward), and
+**displaying** pictures inline: photos, image documents,
 still (WebP) stickers, and the cover thumbnail of videos and GIFs. Everything else is still
 labelled (`[file]`, `[poll]`, …) by `state::media::media_label` and never downloaded — and so is
 a picture whose terminal can't draw it. `grammers_client::media::Media` is `#[non_exhaustive]`,
-so keep the catch-all arm. Sending media, editing, deleting, reactions, animation, and multiple
+so keep the catch-all arm. Sending media, reactions, animation, and multiple
 accounts are deliberately out of scope.
+
+Message actions live behind a cursor rather than a hotkey: `Ctrl+S` puts a highlight on the newest
+message, `↑`/`↓` walk it, and `Enter` opens a menu of what that message offers. Which entries it
+offers is `state::message_actions::actions_for`, and the reasoning behind each omission is in the
+tests there — you cannot edit somebody else's message, a channel has no local-only delete because
+`channels.deleteMessages` takes no `revoke` flag, and unsending someone else's message is only
+offered where moderation exists. Formatting (Markdown/HTML) is out of scope in both directions:
+the `markdown` and `html` features of grammers-client are off, so `Message::text` and
+`InputMessage::text` are plain, and an edit rewrites the whole body. A reply threads on a bare
+message id — quoting part of a parent, or replying across topics, would need `InputReplyTo`.
+A forward carries the whole message and none of grammers' options (silent, drop author, …), all of
+which it hardcodes.
 
 Calls arrive as service messages, which carry neither text nor media, and `state::call::call_label`
 flattens them the same way: `[incoming call · 3:21]`, `[cancelled call]`, `[missed video call]`,
@@ -215,9 +275,18 @@ Keys: `Ctrl+P` opens the newest picture on screen full screen — a modifier bec
 character goes into the compose box — then `←`/`→` step through the chat's pictures and `Esc`
 closes. Stepping clamps at either end rather than wrapping. `Ctrl+A`, a modifier for the same
 reason, opens the action menu on the selected chat: `↑`/`↓` and `Enter` pick, `Esc` closes, and the
-entries that cannot be undone from that screen ask `y`/`n` first. `Ctrl+O` and `Ctrl+E` step
-forwards and backwards through the folder tabs; unlike the viewer's `←`/`→` they wrap, because the
-strip is a ring whose ends are both on screen.
+entries that cannot be undone from that screen ask `y`/`n` first. `Ctrl+S` puts a cursor on the
+newest message in the transcript, where `↑`/`↓` walk it (clamping, like the viewer), `Enter` opens
+that message's menu and `Esc` gives the keyboard back to the compose box. `Ctrl+S` is safe to
+claim despite being XOFF because `ratatui::init` enables raw mode, which clears `IXON`. `Ctrl+O`
+and `Ctrl+E` step forwards and backwards through the folder tabs; unlike the viewer's `←`/`→` they
+wrap, because the strip is a ring whose ends are both on screen.
+
+Four modals stack, and the order in `handle_main_key` is deliberate: viewer, forward picker,
+chat menu, message menu, message cursor. The viewer is first because it is full screen and nothing
+behind it is visible. The forward picker is next because it takes plain characters into its filter,
+so it must be claimed ahead of the menus that navigate with `j`/`k`. Everything modal comes before
+the compose box, which otherwise swallows every letter.
 
 Pictures live in memory only and are never written to disk — the data directory is locked down
 for the session key, and chat photos have no business outliving the process. `state::media`

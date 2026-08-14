@@ -4,3 +4,4 @@ pub mod dialog_actions;
 pub mod dialog_list;
 pub mod folders;
 pub mod media;
+pub mod message_actions;

@@ -3,13 +3,15 @@
 //! The transcript is anchored to the bottom, and `ChatBuffer::scroll` counts lines *up* from
 //! there. That is what lets older messages be prepended without the viewport jumping.
 
+use std::ops::Range;
+
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, ChatViewMetrics, Focus};
-use crate::state::chat_buffer::{ChatBuffer, ChatMessage};
+use crate::state::chat_buffer::{ChatBuffer, ChatMessage, ReplyPreview};
 use crate::ui::images::{ImageStore, inline_rows};
 use crate::ui::text::wrap;
 use crate::ui::widgets::pane;
@@ -29,6 +31,58 @@ const TICK_WIDTH: usize = 2;
 /// not this particular message has been read yet — that is what keeps a message's line count, and
 /// so `scroll`, independent of its read state.
 const TICK_GUTTER: usize = TICK_WIDTH + 1;
+
+/// The cursor's highlight. A background rather than a gutter glyph: the six columns to the left of
+/// a body are not free — a sender header spends five of them on `HH:MM`.
+const SELECTION: Style = Style::new().bg(Color::Indexed(238));
+
+/// What a reply quotes its parent behind.
+const QUOTE_MARK: &str = "┌ ";
+
+/// A reply whose parent has not arrived yet, and one whose parent is gone for good. Both take the
+/// row a resolved quote would, so the transcript's height does not change when a fetch lands.
+const QUOTE_PENDING: &str = "…";
+const QUOTE_MISSING: &str = "message unavailable";
+
+/// The single line a reply's parent is quoted on.
+///
+/// Exactly one line, whatever state the lookup is in — that is the whole contract. `scroll` and
+/// `metrics.total_lines` count lines, so a quote that grew from a placeholder to a resolved parent
+/// would shift the viewport under the reader the moment the fetch came back. Same discipline as
+/// `ImageStore::reserve` and `prepare` sharing `fit`.
+fn quote_line(preview: Option<ReplyPreview>, width: usize) -> Line<'static> {
+    let body = match preview {
+        Some(preview) => {
+            let text = preview.text.replace('\n', " ");
+            let text = if text.trim().is_empty() {
+                QUOTE_MISSING
+            } else {
+                text.trim()
+            };
+            match preview.sender {
+                Some(sender) => format!("{sender}: {text}"),
+                None => text.to_string(),
+            }
+        }
+        None => QUOTE_PENDING.to_string(),
+    };
+
+    // Truncated by display width rather than by chars, so a quote full of wide glyphs still stops
+    // at the pane edge instead of wrapping onto a second row.
+    let room = width.saturating_sub(TIME_WIDTH + QUOTE_MARK.width());
+    let mut quoted = String::new();
+    for ch in body.chars() {
+        if quoted.width() + ch.to_string().width() > room {
+            break;
+        }
+        quoted.push(ch);
+    }
+
+    Line::from(Span::styled(
+        format!("{:TIME_WIDTH$}{QUOTE_MARK}{quoted}", ""),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
 
 /// `✓` for delivered, `✓✓` for read.
 ///
@@ -93,7 +147,18 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App, images: &mut 
 
     let total = transcript.lines.len();
     let max_scroll = total.saturating_sub(viewport);
-    let scroll = buffer.scroll.min(max_scroll);
+    let mut scroll = buffer.scroll.min(max_scroll);
+
+    // The cursor steps in messages; the viewport moves in lines. Only the transcript just built
+    // knows which rows a message covers, so bringing the selection back into view happens here
+    // rather than in the key handler — the same direction `metrics` and the clamped `scroll`
+    // already flow, and `event::run` draws after handling keys, so it lands in the frame the user
+    // sees rather than the one after.
+    if std::mem::take(&mut app.scroll_to_selection)
+        && let Some(range) = &transcript.selection
+    {
+        scroll = scroll_onto(range, total, viewport, scroll);
+    }
 
     app.metrics = ChatViewMetrics {
         total_lines: total,
@@ -124,6 +189,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App, images: &mut 
     }
 
     app.request_visible_photos(&transcript.photos_on_screen(start, end));
+    app.request_reply_targets(&transcript.replies_on_screen(start, end));
 }
 
 /// The transcript as rendered: wrapped lines, plus where the pictures sit among them.
@@ -135,6 +201,32 @@ struct Transcript {
     /// Every message carrying a photo and the line its body starts on, drawn or not. This is
     /// what decides which downloads to ask for.
     photos: Vec<(i32, usize)>,
+    /// Parents quoted on screen whose text is not in the buffer, and the line the quote sits on.
+    /// This is what decides which parents to fetch, exactly as `photos` does for downloads.
+    unresolved_replies: Vec<(i32, usize)>,
+    /// The rows the cursor's message covers, when select mode is on and it is still in the buffer.
+    /// Only the selected one is recorded: nothing else needs a message's line range, and keeping a
+    /// range per message would be a second thing to hold in step with `lines`.
+    selection: Option<Range<usize>>,
+}
+
+/// The scroll offset that brings `range` into view, or the current one when it already is.
+///
+/// Offsets count *up from the bottom*, so the arithmetic runs the other way round from the usual:
+/// a larger `scroll` shows earlier lines. A message taller than the viewport shows its top, where
+/// the sender header is, rather than its tail.
+fn scroll_onto(range: &Range<usize>, total: usize, viewport: usize, current: usize) -> usize {
+    let max_scroll = total.saturating_sub(viewport);
+    let start = max_scroll.saturating_sub(current);
+
+    let wanted = if range.start < start {
+        max_scroll.saturating_sub(range.start)
+    } else if range.end > start + viewport {
+        total.saturating_sub(range.end)
+    } else {
+        current
+    };
+    wanted.min(max_scroll)
 }
 
 /// A picture's slot in the transcript. `line` is an index into `Transcript::lines`, and exactly
@@ -172,12 +264,20 @@ impl Transcript {
     /// Ids of the photo messages showing in `start..end`, whether or not their picture has
     /// arrived — an undownloaded one is exactly what needs requesting.
     fn photos_on_screen(&self, start: usize, end: usize) -> Vec<i32> {
-        self.photos
-            .iter()
-            .filter(|(_, line)| (start..end).contains(line))
-            .map(|(id, _)| *id)
-            .collect()
+        on_screen(&self.photos, start, end)
     }
+
+    /// The same, for reply parents still waiting to be looked up.
+    fn replies_on_screen(&self, start: usize, end: usize) -> Vec<i32> {
+        on_screen(&self.unresolved_replies, start, end)
+    }
+}
+
+fn on_screen(rows: &[(i32, usize)], start: usize, end: usize) -> Vec<i32> {
+    rows.iter()
+        .filter(|(_, line)| (start..end).contains(line))
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 fn build_transcript(
@@ -213,7 +313,10 @@ fn build_transcript(
     }
 
     let mut previous: Option<&ChatMessage> = None;
+    let mut selection: Option<Range<usize>> = None;
+    let mut unresolved_replies: Vec<(i32, usize)> = Vec::new();
     for message in &buffer.messages {
+        let from = lines.len();
         if starts_new_group(previous, message) {
             let (who, who_style) = if message.outgoing {
                 ("you".to_string(), Style::default().fg(Color::Green).bold())
@@ -231,6 +334,16 @@ fn build_transcript(
                 ),
                 Span::styled(who, who_style),
             ]));
+        }
+
+        // A reply carries its parent on one line above it, whether or not the parent has been
+        // found. Above the picture as well as the text, because the reply is to the whole message.
+        if let Some(parent) = message.reply_to {
+            let preview = buffer.reply_preview(parent);
+            if preview.is_none() {
+                unresolved_replies.push((parent, lines.len()));
+            }
+            lines.push(quote_line(preview, width));
         }
 
         // A blank body is a service message we don't spell out, and a receipt hanging off an empty
@@ -309,6 +422,26 @@ fn build_transcript(
                 }
             }
         }
+
+        // The highlight is painted on afterwards rather than woven into the pushes above, which is
+        // what makes it provably free of line accounting: it can only restyle and pad rows that
+        // already exist. `scroll` and `metrics.total_lines` are denominated in lines, so a cursor
+        // that added or dropped one would drift the viewport every time it moved — the same
+        // discipline as `ImageStore::reserve` and the reserved tick column.
+        //
+        // A photo's reserved rows get styled too and are then painted over by `SlicedImage`, so on
+        // a picture the highlight only shows on the caption or receipt line below it.
+        if buffer.selected == Some(message.id) {
+            for line in &mut lines[from..] {
+                let pad = width.saturating_sub(line.width());
+                if pad > 0 {
+                    line.spans.push(Span::raw(" ".repeat(pad)));
+                }
+                line.style = SELECTION;
+            }
+            selection = Some(from..lines.len());
+        }
+
         previous = Some(message);
     }
 
@@ -316,6 +449,8 @@ fn build_transcript(
         lines,
         images: placements,
         photos,
+        unresolved_replies,
+        selection,
     }
 }
 
@@ -334,13 +469,33 @@ fn render_compose(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Messages;
     let has_chat = app.open_chat.is_some();
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused {
             Color::Cyan
         } else {
             Color::DarkGray
         }));
+
+    // What Enter will do, as a title rather than an extra row: the box is a fixed three lines, so
+    // there is nowhere to put a line without taking one off the transcript. The two are mutually
+    // exclusive — `start_reply` cancels an edit, and an edit cannot change what it replies to.
+    if app.editing.is_some() {
+        block = block.title(Span::styled(
+            " Editing — Esc to abandon ",
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if let Some(parent) = app.replying_to {
+        let who = app
+            .open_buffer()
+            .and_then(|buffer| buffer.reply_preview(parent))
+            .and_then(|preview| preview.sender)
+            .unwrap_or_else(|| "message".to_string());
+        block = block.title(Span::styled(
+            format!(" Replying to {who} — Esc to cancel "),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
 
     let content = if !has_chat {
         Span::styled("", Style::default())
@@ -389,6 +544,220 @@ mod tests {
         buffer.has_more_older = true;
         buffer.messages.extend(messages);
         buffer
+    }
+
+    /// The invariant the whole cursor design hangs on. `scroll` and `metrics.total_lines` count
+    /// lines, so a highlight that cost or saved a row would shift the viewport every time the
+    /// cursor moved — and it moves on every keystroke.
+    #[test]
+    fn highlighting_a_message_does_not_change_the_line_count() {
+        let mut buffer = buffer_of(page(10, 5).into_iter().rev().collect());
+        let plain = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+
+        for id in 6..=10 {
+            buffer.selected = Some(id);
+            let marked = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+            assert_eq!(
+                marked.lines.len(),
+                plain.lines.len(),
+                "selecting message {id} changed the transcript's height"
+            );
+        }
+    }
+
+    #[test]
+    fn the_highlight_covers_the_selected_message_and_nothing_else() {
+        let mut buffer = buffer_of(page(10, 5).into_iter().rev().collect());
+        buffer.selected = Some(8);
+
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+        let range = transcript
+            .selection
+            .clone()
+            .expect("a selected message that is in the buffer must report its rows");
+
+        for (n, line) in transcript.lines.iter().enumerate() {
+            assert_eq!(
+                line.style == SELECTION,
+                range.contains(&n),
+                "line {n} is styled the wrong way round for a selection of {range:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_on_a_message_that_is_gone_reports_no_rows() {
+        let mut buffer = buffer_of(page(10, 5).into_iter().rev().collect());
+        buffer.selected = Some(999);
+
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+
+        assert!(
+            transcript.selection.is_none(),
+            "nothing to scroll onto means nothing must be scrolled"
+        );
+    }
+
+    #[test]
+    fn a_selection_already_on_screen_is_left_where_it_is() {
+        // Rows 4..6 of a 10-line transcript, with a 10-line viewport showing all of it.
+        assert_eq!(scroll_onto(&(4..6), 10, 10, 0), 0);
+    }
+
+    #[test]
+    fn a_selection_above_the_viewport_scrolls_up_to_show_its_first_row() {
+        // 30 lines, a 10-row viewport pinned to the bottom: rows 20..30 are showing.
+        // Offsets count up from the bottom, so putting row 2 at the top means scrolling 18.
+        assert_eq!(scroll_onto(&(2..4), 30, 10, 0), 18);
+    }
+
+    #[test]
+    fn a_selection_below_the_viewport_scrolls_down_just_far_enough() {
+        // Scrolled 18 up, rows 2..12 are showing; row 25 is well below.
+        // Landing its last row on the bottom edge means an offset of 30 - 26.
+        assert_eq!(scroll_onto(&(24..26), 30, 10, 18), 4);
+    }
+
+    /// A picture plus its caption can be taller than the pane. Showing the tail would put the
+    /// sender header off screen, which is the part that says whose message it is.
+    #[test]
+    fn a_message_taller_than_the_viewport_shows_its_top() {
+        assert_eq!(
+            scroll_onto(&(0..25), 30, 10, 0),
+            20,
+            "an oversized message must be scrolled to its first row, not its last"
+        );
+    }
+
+    /// A reply whose parent is in the buffer.
+    fn reply(id: i32, text: &str, to: i32) -> ChatMessage {
+        ChatMessage {
+            reply_to: Some(to),
+            ..message(id, text)
+        }
+    }
+
+    /// The reply counterpart of the reserve/prepare invariant. The quote starts as a placeholder
+    /// and becomes a real one when the fetch lands; if that changed the height, the viewport would
+    /// jump under the reader at an arbitrary moment.
+    #[test]
+    fn an_unresolved_reply_quote_claims_the_same_row_as_a_resolved_one() {
+        let mut buffer = buffer_of(vec![reply(11, "the usual place", 7)]);
+        let pending = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+
+        buffer.reply_previews.insert(
+            7,
+            ReplyPreview {
+                sender: Some("Bob".to_string()),
+                text: "where should we meet?".to_string(),
+            },
+        );
+        let resolved = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+
+        assert_eq!(
+            pending.lines.len(),
+            resolved.lines.len(),
+            "the quote must claim its row before the parent arrives, not after"
+        );
+    }
+
+    #[test]
+    fn a_reply_quotes_its_parent_above_itself() {
+        let buffer = buffer_of(vec![
+            message(7, "where should we meet?"),
+            reply(11, "the usual place", 7),
+        ]);
+
+        let lines = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled()).lines;
+        let quote = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|s| s.content.contains(QUOTE_MARK)))
+            .expect("the reply should carry a quote line");
+        let body = lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.contains("the usual place"))
+            })
+            .expect("the reply's own text should be there too");
+
+        assert!(
+            quote < body,
+            "the quote introduces the reply, so it goes above it"
+        );
+        assert!(
+            lines[quote]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("where should we meet?")),
+            "a parent already in the buffer needs no fetch to be quoted"
+        );
+    }
+
+    #[test]
+    fn a_parent_that_is_not_loaded_is_asked_for_once_it_is_on_screen() {
+        let buffer = buffer_of(vec![reply(11, "the usual place", 7)]);
+
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+
+        assert_eq!(
+            transcript.replies_on_screen(0, transcript.lines.len()),
+            [7],
+            "a quote with nothing to quote is exactly what needs fetching"
+        );
+    }
+
+    #[test]
+    fn a_parent_already_in_the_buffer_is_never_asked_for() {
+        let buffer = buffer_of(vec![
+            message(7, "where should we meet?"),
+            reply(11, "yes", 7),
+        ]);
+
+        let transcript = build_transcript(&buffer, None, 40, ROWS, &mut ImageStore::disabled());
+
+        assert!(
+            transcript
+                .replies_on_screen(0, transcript.lines.len())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_quote_stops_at_the_pane_edge_rather_than_wrapping() {
+        let long = "a".repeat(200);
+        let line = quote_line(
+            Some(ReplyPreview {
+                sender: Some("Alice".to_string()),
+                text: long,
+            }),
+            40,
+        );
+
+        assert!(
+            line.width() <= 40,
+            "a quote wider than the pane would wrap and cost a second row: {}",
+            line.width()
+        );
+    }
+
+    #[test]
+    fn a_multi_line_parent_is_quoted_on_one_line() {
+        let line = quote_line(
+            Some(ReplyPreview {
+                sender: None,
+                text: "first\nsecond\nthird".to_string(),
+            }),
+            60,
+        );
+
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains('\n'),
+            "a newline in a quote would be a second row"
+        );
+        assert!(text.contains("first second third"));
     }
 
     #[test]

@@ -46,6 +46,40 @@ pub enum TgCommand {
     SendMessage {
         peer: PeerRef,
         text: String,
+        /// The message being replied to, if this is a reply. Telegram threads on a bare id.
+        reply_to: Option<i32>,
+    },
+    /// Fetch the parents of replies on screen whose parent is not in the buffer. Issued by
+    /// visibility, the same way photos are.
+    LoadReplyTargets {
+        peer: PeerRef,
+        ids: Vec<i32>,
+    },
+
+    // -- message actions -----------------------------------------------------
+    //
+    // Like the chat actions below, these change what the account really holds and are visible on
+    // every other device. They are only ever issued from an explicit menu choice, and the two
+    // deletes pass a confirmation first.
+    /// Remove messages from this chat. `revoke` decides whose copies go: ours only, or everyone's.
+    DeleteMessages {
+        peer: PeerRef,
+        ids: Vec<i32>,
+        revoke: bool,
+    },
+    /// Replace the text of one of our own messages. Telegram's edit window is the server's to
+    /// enforce; past it the request comes back as an error and the banner says so.
+    EditMessage {
+        peer: PeerRef,
+        message_id: i32,
+        text: String,
+    },
+    /// Copy messages from one conversation into another. A chat with forwarding restricted
+    /// refuses server-side — there is no flag on the dialog row that says so in advance.
+    ForwardMessages {
+        source: PeerRef,
+        ids: Vec<i32>,
+        destination: PeerRef,
     },
 
     // -- chat actions --------------------------------------------------------
