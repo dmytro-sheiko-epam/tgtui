@@ -5,3 +5,4 @@ pub mod dialog_list;
 pub mod folders;
 pub mod media;
 pub mod message_actions;
+pub mod peer_info;
