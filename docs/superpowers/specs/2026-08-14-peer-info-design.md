@@ -17,9 +17,10 @@ on some of them would be worse than no entry.
 | Basic group | `messages.getFullChat` | `about`, participant count, `chat_photo` |
 | Megagroup / channel | `channels.getFullChannel` | `about`, `participants_count`, `online_count`, `admins_count`, `slowmode_seconds`, `chat_photo` |
 
-`PeerKind`'s three variants line up one-to-one with those three calls — a megagroup is a `Channel`
-and takes `channels.getFullChannel` correctly — so the actor dispatches on the peer it was already
-handed and the command carries nothing else.
+`PeerKind`'s three variants line up one-to-one with those three calls — `User` → `users.getFullUser`,
+`Chat` (a basic group) → `messages.getFullChat`, `Channel` → `channels.getFullChannel`, which a
+megagroup takes correctly because it *is* a `Channel`. So the actor dispatches on the peer it was
+already handed and the command carries nothing else.
 
 grammers 0.10 wraps none of the three, so all three are raw `client.invoke`s. That is the
 established path here: `messages.getDialogFilters`, `contacts.block` and the hand-rolled archive
