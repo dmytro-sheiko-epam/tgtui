@@ -115,9 +115,18 @@ pub fn photo_media(sizes: &[tl::enums::PhotoSize]) -> Media {
 /// A profile photo as `users.getFullUser` delivers one: a bare `tl::enums::Photo` rather than the
 /// `MessageMediaPhoto` a message carries.
 pub fn profile_photo(sizes: &[tl::enums::PhotoSize]) -> grammers_client::media::Photo {
+    profile_photo_with_id(1, sizes)
+}
+
+/// The same, with the picture's own id spelled out — what tells one avatar from the next one the
+/// peer puts up.
+pub fn profile_photo_with_id(
+    id: i64,
+    sizes: &[tl::enums::PhotoSize],
+) -> grammers_client::media::Photo {
     grammers_client::media::Photo::from_raw(tl::enums::Photo::Photo(tl::types::Photo {
         has_stickers: false,
-        id: 1,
+        id,
         access_hash: 1,
         file_reference: Vec::new(),
         date: 0,

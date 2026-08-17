@@ -93,10 +93,11 @@ pub enum TgCommand {
 
     /// Fetch the peer's current profile picture.
     ///
-    /// Its own command rather than a widening of `DownloadPhoto`, whose path is tuned around
-    /// three things an avatar does not have: a visibility trigger that fires every frame, the
-    /// in-flight cap, and the decoded-image eviction queue. There is exactly one avatar, it is
-    /// always on screen, and it dies with the screen.
+    /// Its own command rather than a widening of `DownloadPhoto`, whose path is tuned around two
+    /// things an avatar does not have: an in-flight cap, and the decoded-image eviction queue.
+    /// There is exactly one avatar and it dies with the screen. Like a transcript photo it is
+    /// asked for by the frame that has somewhere to draw it, so it is never fetched on a terminal
+    /// that cannot show it.
     DownloadAvatar {
         peer: PeerRef,
         source: Box<PhotoSource>,

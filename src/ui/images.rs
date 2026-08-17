@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grammers_session::types::PeerId;
 use image::DynamicImage;
 use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
@@ -21,10 +20,16 @@ use crate::config::ImageMode;
 /// Was a bare message id until profiles arrived. An avatar has no message to be keyed by, and a
 /// synthetic id would collide with a real one the moment a chat's ids reached it — channel ids
 /// restart at 1 per channel, so there is no id space that is safely out of the way.
+///
+/// Both variants name *one picture forever*, which is what makes a hit on `(key, size)` safe to
+/// serve without looking at the image again. That is why the avatar carries `tl::types::Photo.id`
+/// and not the peer's: a peer id names whatever they are wearing today, so a peer who changed
+/// their photo mid-session would be redrawn from the encoding the old one left behind — and a
+/// profile is fetched fresh on every open precisely so that cannot happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageKey {
     Message(i32),
-    Avatar(PeerId),
+    Avatar(i64),
 }
 
 /// Encoded pictures kept at once. A picture on screen is held at two sizes — inline and, once
@@ -408,6 +413,33 @@ mod tests {
             store.protocol(ImageKey::Message(1), inline).is_some()
                 && store.protocol(ImageKey::Message(1), full).is_some(),
             "both must survive, or every trip in and out of the viewer re-encodes"
+        );
+    }
+
+    /// The reason `ImageKey::Avatar` holds the photo's own id rather than the peer's: a hit on
+    /// `(key, size)` is served without consulting the image, so a key that named the peer would
+    /// hand back the picture they used to have.
+    #[test]
+    fn a_peer_who_changes_their_picture_is_not_drawn_from_the_old_one() {
+        let mut store = ImageStore::for_tests();
+
+        let old = store
+            .prepare(ImageKey::Avatar(11), &image(100, 200), 20, 10)
+            .unwrap();
+        let new = store
+            .prepare(ImageKey::Avatar(22), &image(100, 200), 20, 10)
+            .unwrap();
+
+        assert_eq!(
+            old, new,
+            "two square-ish pictures of the same pixels claim the same box; the point here is the \
+             key, not the size"
+        );
+        assert_eq!(
+            store.cache.len(),
+            2,
+            "the second picture reused the first one's entry, so a peer who changes their avatar \
+             mid-session would keep being drawn with the one they replaced"
         );
     }
 

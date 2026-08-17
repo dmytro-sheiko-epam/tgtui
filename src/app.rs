@@ -493,11 +493,9 @@ impl App {
                     view.state = state;
                 }
 
-                // Requested here rather than from the renderer, unlike the transcript's photos:
-                // there is exactly one avatar and it is on screen the moment the profile is, so
-                // there is nothing for a visibility trigger to decide. `PhotoState` is still the
-                // guard, so a second answer for the same screen changes nothing.
-                self.request_avatar();
+                // The picture is not asked for here. `peer_view::render` does it, once it has a
+                // box reserved to draw one in — with images off there is nothing to show and so
+                // nothing worth downloading.
             }
 
             TgEvent::AvatarLoaded { peer, image } => {
@@ -512,9 +510,9 @@ impl App {
                     return;
                 };
 
-                // `Failed` is terminal. Nothing retries it, because the picture is asked for once
-                // and the screen has initials to fall back to.
-                avatar.state = match image {
+                // `Failed` is terminal. Nothing retries it, because the trigger fires on every
+                // frame and the screen has initials to fall back to.
+                avatar.picture.state = match image {
                     Some(image) => PhotoState::Ready(image),
                     None => PhotoState::Failed,
                 };
@@ -926,19 +924,26 @@ impl App {
 
     // -- the profile screen ---------------------------------------------------
 
-    /// Open the selected conversation's profile and ask for it.
+    /// Open one conversation's profile and ask for it.
+    ///
+    /// Takes the peer rather than reading the selection, because the caller captured it when the
+    /// menu opened and the selection can move under an open menu — a `DialogGone` for the chat the
+    /// popup names shifts it to a neighbour, and re-reading here would put up somebody else's
+    /// profile under the name the user was looking at.
     ///
     /// Nothing is applied locally and nothing is assumed: the screen goes up in its loading state
     /// and the fields arrive when the server answers.
-    pub fn open_peer_info(&mut self) {
-        let Some(summary) = self.dialogs.selected_summary() else {
-            return self.set_status("no chat selected", StatusKind::Info);
+    pub fn open_peer_info(&mut self, peer: PeerRef) {
+        // The name comes off the dialog row, so the title is right before the fetch lands. No row
+        // means the conversation ended while the menu was up: there is no name to head the screen
+        // with, and heading it with a stale one would be a claim about a chat that is gone.
+        let Some(name) = self.dialogs.find(peer.id).map(|item| item.name.clone()) else {
+            return self.set_status("that chat is gone", StatusKind::Info);
         };
 
-        let peer = summary.peer;
         self.peer_info = Some(PeerInfoView {
             peer,
-            name: summary.name.clone(),
+            name,
             state: InfoState::Loading,
             scroll: 0,
         });
@@ -946,7 +951,12 @@ impl App {
     }
 
     /// Fetch the open profile's picture, if it has one that has not been asked for yet.
-    fn request_avatar(&mut self) {
+    ///
+    /// Called by `peer_view::render` once it has a box to draw the picture in, the way
+    /// `render_transcript` calls [`Self::request_visible_photos`]: whether anything can be drawn
+    /// at all is the renderer's knowledge, not the state machine's. `PhotoState` is the in-flight
+    /// guard, so being called on every frame costs one match.
+    pub fn request_avatar(&mut self) {
         let Some(view) = self.peer_info.as_mut() else {
             return;
         };
@@ -956,14 +966,14 @@ impl App {
         let Some(avatar) = info.avatar.as_mut() else {
             return;
         };
-        if !matches!(avatar.state, PhotoState::Pending) {
+        if !matches!(avatar.picture.state, PhotoState::Pending) {
             return;
         }
 
-        avatar.state = PhotoState::Loading;
+        avatar.picture.state = PhotoState::Loading;
         let command = TgCommand::DownloadAvatar {
             peer: view.peer,
-            source: Box::new(avatar.source.clone()),
+            source: Box::new(avatar.picture.source.clone()),
         };
         self.send(command);
     }
@@ -1040,7 +1050,9 @@ impl App {
         // menu's Reply and Edit only aim the compose box — which is why `in_progress` is an
         // `Option` and why this returns before reaching the channel.
         if action == DialogAction::Info {
-            return self.open_peer_info();
+            // `menu.peer`, like every other entry, rather than whatever is selected now: the
+            // selection may have moved since the popup went up.
+            return self.open_peer_info(peer);
         }
 
         self.send(match action {
@@ -1593,14 +1605,14 @@ mod tests {
     /// The selected chat's profile, opened and answered.
     fn opened_profile() -> (App, mpsc::UnboundedReceiver<TgCommand>) {
         let (mut app, rx) = opened_chat();
-        app.open_peer_info();
+        app.open_peer_info(peer(1));
         (app, rx)
     }
 
     #[test]
     fn opening_a_profile_asks_for_it_and_shows_the_name_while_it_waits() {
         let (mut app, mut rx) = opened_chat();
-        app.open_peer_info();
+        app.open_peer_info(peer(1));
 
         let view = app.peer_info.as_ref().expect("the screen is open");
         assert_eq!(
@@ -1680,8 +1692,10 @@ mod tests {
         );
     }
 
+    /// The trigger lives in `peer_view::render`, which only fires it once it has a box to draw
+    /// the picture in — `request_avatar` here stands for the frame that reserved one.
     #[test]
-    fn a_profile_with_a_picture_asks_for_it_once() {
+    fn a_profile_with_a_picture_asks_for_it_once_and_only_when_asked_to() {
         let (mut app, mut rx) = opened_profile();
         drain(&mut rx);
 
@@ -1689,11 +1703,24 @@ mod tests {
             peer: peer(1).id,
             info: Ok(Box::new(profile_with_avatar())),
         });
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the profile landing is not evidence the picture can be shown; a terminal with no \
+             graphics protocol would spend the download and discard every byte"
+        );
 
+        app.request_avatar();
         assert!(matches!(
             drain(&mut rx).as_slice(),
             [TgCommand::DownloadAvatar { peer: asked, .. }] if asked.id == peer(1).id
         ));
+
+        app.request_avatar();
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the renderer calls this on every frame, so `PhotoState` has to be the guard or the \
+             picture would be fetched four times a second"
+        );
     }
 
     #[test]
@@ -1705,6 +1732,7 @@ mod tests {
             peer: peer(1).id,
             info: Ok(Box::new(user_full("Alice"))),
         });
+        app.request_avatar();
 
         assert!(
             drain(&mut rx).is_empty(),
@@ -1728,7 +1756,7 @@ mod tests {
         let InfoState::Ready(info) = &app.peer_info.as_ref().unwrap().state else {
             panic!("the profile should be ready");
         };
-        assert!(info.avatar.as_ref().unwrap().image().is_some());
+        assert!(info.avatar.as_ref().unwrap().picture.image().is_some());
     }
 
     #[test]
@@ -1744,12 +1772,14 @@ mod tests {
             peer: peer(1).id,
             image: None,
         });
+        // The frame after the failure, which asks again whether there is anything to fetch.
+        app.request_avatar();
 
         let InfoState::Ready(info) = &app.peer_info.as_ref().unwrap().state else {
             panic!("the profile should be ready");
         };
         assert!(matches!(
-            info.avatar.as_ref().unwrap().state,
+            info.avatar.as_ref().unwrap().picture.state,
             PhotoState::Failed
         ));
         assert!(
@@ -3601,6 +3631,38 @@ mod tests {
             drain(&mut rx).as_slice(),
             [TgCommand::LoadPeerInfo { .. }]
         ));
+    }
+
+    /// `forget_dialog` does not close an open chat menu, so the selection can move out from under
+    /// one. Every other entry acts on `menu.peer`; Info has to as well, or it opens a profile of a
+    /// conversation the popup never named.
+    #[test]
+    fn a_chat_that_goes_while_its_menu_is_up_does_not_hand_info_the_next_one() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(app.menu.as_ref().unwrap().name, "Alice");
+
+        app.handle_event(TgEvent::DialogGone {
+            peer: peer(1).id,
+            reason: "deleted",
+        });
+        drain(&mut rx);
+        // Info is the first entry, so the menu is still on it.
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            app.menu.is_none(),
+            "the entry ran — the menu is not left standing, so this is about which peer it acted on"
+        );
+        assert!(
+            app.peer_info.is_none(),
+            "the selection moved to Bob when Alice's row went; re-reading it here would put Bob's \
+             profile up under the menu the user opened on Alice"
+        );
+        assert!(
+            drain(&mut rx).is_empty(),
+            "and would spend a request on him too"
+        );
     }
 
     #[test]

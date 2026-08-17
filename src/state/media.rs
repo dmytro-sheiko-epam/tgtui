@@ -110,6 +110,17 @@ fn document_source(document: &Document) -> Option<(PhotoSource, (u32, u32))> {
     None
 }
 
+/// A peer's current profile picture, carried with the id of the picture itself.
+#[derive(Debug, Clone)]
+pub struct Avatar {
+    /// `tl::types::Photo.id`, which is globally unique and immutable: it names *this* picture
+    /// forever, the way a message id does. Carried because the encoding cache has to be keyed by
+    /// it — a peer id names whatever the peer is wearing today, so a peer who changes their photo
+    /// while tgtui is running would be drawn from the entry the old one left behind.
+    pub id: i64,
+    pub picture: PhotoRef,
+}
+
 /// A peer's current profile picture, as a downloadable reference.
 ///
 /// Deliberately shares `pick_thumb` with [`photo_ref`], the way `dialog_list::is_muted` is shared
@@ -117,15 +128,20 @@ fn document_source(document: &Document) -> Option<(PhotoSource, (u32, u32))> {
 /// eventually disagree about what "sized for a terminal" means.
 ///
 /// `None` for a peer with no picture, and for `photoEmpty`, which has no sizes at all.
-pub fn avatar_ref(photo: &Photo) -> Option<PhotoRef> {
+pub fn avatar_ref(photo: &Photo) -> Option<Avatar> {
     let (source, pixels) = pick_thumb(photo.thumbs())?;
-    Some(PhotoRef {
-        source,
-        pixels,
-        // Never printed: the info screen falls back to the peer's initials rather than a label,
-        // because a bordered box with `[photo]` in it reads as a broken picture.
-        label: "[photo]",
-        state: PhotoState::Pending,
+    Some(Avatar {
+        // Read after `pick_thumb` has answered, which it only does for a `photo` — `Photo::id`
+        // unwraps the raw enum and a `photoEmpty` has no picture to name.
+        id: photo.id(),
+        picture: PhotoRef {
+            source,
+            pixels,
+            // Never printed: the info screen falls back to the peer's initials rather than a
+            // label, because a bordered box with `[photo]` in it reads as a broken picture.
+            label: "[photo]",
+            state: PhotoState::Pending,
+        },
     })
 }
 
@@ -313,12 +329,32 @@ mod tests {
         .expect("a profile photo with sizes is downloadable");
 
         assert_eq!(
-            avatar.pixels,
+            avatar.picture.pixels,
             (640, 640),
             "sharing `pick_thumb` with `photo_ref` is what keeps the two from disagreeing about \
              what a terminal-sized source is"
         );
-        assert!(matches!(avatar.state, PhotoState::Pending));
+        assert!(matches!(avatar.picture.state, PhotoState::Pending));
+    }
+
+    #[test]
+    fn an_avatar_is_named_by_the_picture_rather_than_by_the_peer() {
+        let old = avatar_ref(&crate::test_support::profile_photo_with_id(
+            11,
+            &[crate::test_support::thumb("x", 160, 160)],
+        ))
+        .expect("a profile photo with sizes is downloadable");
+        let new = avatar_ref(&crate::test_support::profile_photo_with_id(
+            22,
+            &[crate::test_support::thumb("x", 160, 160)],
+        ))
+        .expect("a profile photo with sizes is downloadable");
+
+        assert_ne!(
+            old.id, new.id,
+            "the id is what keys the encoding cache; if the same peer's new picture came back \
+             under the old id, changing an avatar mid-session would keep drawing the old one"
+        );
     }
 
     #[test]

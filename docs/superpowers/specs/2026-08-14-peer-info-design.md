@@ -36,7 +36,7 @@ The four-step shape the rest of the app uses: new `TgCommand` → actor arm → 
 `App::handle_event` arm → render.
 
 ```
-Ctrl+A ─> chat menu ─> Info ─> App::open_peer_info
+Ctrl+A ─> chat menu ─> Info ─> App::open_peer_info(menu.peer)
                                     │  peer_info = Some(PeerInfoView { state: Loading })
                                     ▼
                           TgCommand::LoadPeerInfo { peer }
@@ -47,7 +47,10 @@ Ctrl+A ─> chat menu ─> Info ─> App::open_peer_info
                                     ▼
                           App  ─>  InfoState::Ready | Failed
                                     │
-                          TgCommand::DownloadAvatar  (once, if there is a photo)
+                          peer_view::render reserves a box for the picture
+                                    │
+                          TgCommand::DownloadAvatar  (once, if there is a photo
+                                    │                 and a way to draw it)
                                     ▼
                           TgEvent::AvatarLoaded ─> PhotoState::Ready
 ```
@@ -135,7 +138,7 @@ pub struct PeerInfo {
     /// sitting in a label column.
     pub about: Option<String>,
     pub rows: Vec<InfoRow>,
-    pub avatar: Option<PhotoRef>,
+    pub avatar: Option<Avatar>,
 }
 
 pub struct InfoRow {
@@ -186,27 +189,37 @@ Screen::Main if app.peer_info.is_some() => peer_view::render(..),
 `ImageStore`'s cache key stops being a bare message id:
 
 ```rust
-pub enum ImageKey { Message(i32), Avatar(PeerId) }
+pub enum ImageKey { Message(i32), Avatar(i64) }
 // HashMap<(i32, Size), Cached>  ->  HashMap<(ImageKey, Size), Cached>
 ```
 
 `ImageStore::prepare` takes the same key. Nothing else about the store changes.
+
+The avatar's `i64` is `tl::types::Photo.id`, not the peer's. `prepare` serves a `(key, size)` hit
+without consulting the image, which is only sound for a key that names one picture forever — true
+of a message id, false of a peer id, whose picture changes the moment the peer changes theirs. That
+is why `avatar_ref` returns `state::media::Avatar { id, picture }` rather than a bare `PhotoRef`:
+`peer_view` needs the picture's own identity at draw time.
 
 The avatar comes out of the profile response itself: `userFull.profile_photo`,
 `chatFull.chat_photo` and `channelFull.chat_photo` are all `tl::enums::Photo`, and
 `grammers_client::media::Photo::from_raw` is public, so there is no extra round trip to *discover*
 the picture — only to fetch it.
 
-`state::media` gains one function for this, `avatar_ref(&Photo) -> Option<PhotoRef>`, sitting beside
+`state::media` gains one function for this, `avatar_ref(&Photo) -> Option<Avatar>`, sitting beside
 `photo_ref` and sharing its `pick_thumb` (currently private, and staying private). Both then agree on
 what a terminal-sized source is, the way `is_muted` is shared by the dialog seed and the live update.
 A `photoEmpty` yields no thumbs, so it returns `None` and the header draws as text — no special case.
 
 The download is its own command/event pair rather than a widening of `DownloadPhoto`. The
-transcript's path is tuned around three things the avatar does not have: a visibility trigger that
-fires every frame, the `MAX_PHOTO_DOWNLOADS` cap, and the `decoded` eviction queue. There is exactly
-one avatar, it is always on screen, and it dies with the screen — so it is requested once, when
-`PeerInfoLoaded` lands with a `Pending` avatar, and `PhotoState` guards it as usual.
+transcript's path is tuned around two things the avatar does not have: the `MAX_PHOTO_DOWNLOADS`
+cap and the `decoded` eviction queue. There is exactly one avatar and it dies with the screen.
+
+The trigger is the transcript's, though: `peer_view::render` calls `App::request_avatar` once
+`header` has reserved a box, exactly as `render_transcript` calls `request_visible_photos`. No way
+to show it is no reason to fetch it — with `TGTUI_IMAGES=off`, or on a terminal that reported no
+graphics protocol, `reserve` answers `None`, the header draws initials, and nothing is downloaded.
+`PhotoState` is the in-flight guard, because the trigger fires again on the very next frame.
 
 ### Key handling
 
@@ -239,6 +252,12 @@ destructive-last so a mistyped `Enter` lands somewhere harmless; Info changes no
   below it never jump. A peer with no photo reserves nothing, which is known before the first draw.
 - **A profile must not outlive its conversation.** `App::forget_dialog` clears `peer_info` when it
   names the peer that went, as it already clears the chat buffer and the compose box.
+- **`Info` acts on the peer the popup named.** `open_peer_info` takes a `PeerRef` and `run_action`
+  passes `menu.peer`, like every other entry, rather than re-reading the selection: a `DialogGone`
+  arriving under an open menu moves the selection without closing it. A peer with no dialog row left
+  opens nothing and says so.
+- **An avatar's encoding is keyed by the picture.** `ImageKey::Avatar` holds the photo id, so a peer
+  who changes their picture mid-session is not redrawn from the entry the old one left behind.
 
 ## Error handling
 
@@ -246,7 +265,7 @@ destructive-last so a mistyped `Enter` lands somewhere harmless; Info changes no
 | --- | --- |
 | The fetch — network, flood wait, `CHANNEL_PRIVATE`, privacy restrictions | `Err(String)` → `InfoState::Failed`, printed in the body. Title and `Esc` keep working. It lives on the screen rather than in the status banner, because the banner is transient and this screen is not. |
 | The avatar download | `PhotoState::Failed`. The reserved box keeps its rows and shows the peer's initials dimmed; collapsing it would shift every field below. |
-| No graphics protocol (`TGTUI_IMAGES=off`, or the terminal query failed) | `reserve` returns `None`, no box, header is text only. Falls out of existing code. |
+| No graphics protocol (`TGTUI_IMAGES=off`, or the terminal query failed) | `reserve` returns `None`, no box, header is text only — and no download, because the fetch is triggered by the frame that reserved the box. |
 | Peer has no profile photo | No box reserved, header is text only. |
 | Terminal too short for the header | Guard as `forward_picker` does with `inner.height < 2`: draw the fields rather than a clipped half-avatar. |
 | No chat selected when `Ctrl+A` is pressed | Existing "no chat selected" status; the menu never opens, so neither does this. |

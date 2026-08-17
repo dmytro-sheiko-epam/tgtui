@@ -118,14 +118,16 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use tokio::sync::mpsc;
+
     use super::*;
     use crate::app::App;
     use crate::state::chat_buffer::PAGE_SIZE;
     use crate::state::dialog_list::FolderTab;
-    use crate::telegram::TgEvent;
+    use crate::telegram::{TgCommand, TgEvent};
     use crate::test_support::{
-        app, channel_dialog, dialog, folder, gradient, loaded_photo_message, message, page, peer,
-        profile_with_avatar,
+        app, channel_dialog, dialog, drain, folder, gradient, loaded_photo_message, message, page,
+        peer, profile_with_avatar, user_full,
     };
 
     /// Render an app to a fixed-size test terminal and return the screen as text.
@@ -141,7 +143,12 @@ mod tests {
     }
 
     fn loaded_app() -> App {
-        let (mut app, _rx) = app();
+        loaded_app_with_commands().0
+    }
+
+    /// The same, keeping the receiving end, for the frames that issue commands of their own.
+    fn loaded_app_with_commands() -> (App, mpsc::UnboundedReceiver<TgCommand>) {
+        let (mut app, rx) = app();
         app.handle_event(TgEvent::Authorized(true));
         app.handle_event(TgEvent::DialogsLoaded {
             items: vec![dialog(1, "Alice"), dialog(2, "Bob")],
@@ -152,7 +159,7 @@ mod tests {
             peer: peer(1).id,
             messages: page(100, PAGE_SIZE as i32),
         });
-        app
+        (app, rx)
     }
 
     #[test]
@@ -635,7 +642,7 @@ mod tests {
 
     /// The selected chat's profile, open and answered, with a picture not yet downloaded.
     fn with_profile(app: &mut App) {
-        app.open_peer_info();
+        app.open_peer_info(peer(1));
         app.handle_event(TgEvent::PeerInfoLoaded {
             peer: peer(1).id,
             info: Ok(Box::new(profile_with_avatar())),
@@ -675,6 +682,81 @@ mod tests {
             !screen.contains("Tab compose"),
             "`handle_peer_info_key` swallows the compose keys, so advertising them would be a \
              lie about what the keyboard does:\n{screen}"
+        );
+    }
+
+    /// Draw one frame with a given store and report the commands that frame issued.
+    fn commands_of_a_frame(
+        app: &mut App,
+        rx: &mut mpsc::UnboundedReceiver<TgCommand>,
+        images: &mut ImageStore,
+    ) -> Vec<TgCommand> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app, images)).unwrap();
+        drain(rx)
+    }
+
+    /// The picture is asked for by the frame that has somewhere to put it, the way
+    /// `render_transcript` asks for the photos it just drew.
+    #[test]
+    fn the_frame_that_reserves_a_box_for_the_avatar_is_the_one_that_fetches_it() {
+        let (mut app, mut rx) = loaded_app_with_commands();
+        with_profile(&mut app);
+        drain(&mut rx);
+        let mut images = ImageStore::for_tests();
+
+        let first = commands_of_a_frame(&mut app, &mut rx, &mut images);
+        let second = commands_of_a_frame(&mut app, &mut rx, &mut images);
+
+        assert!(
+            matches!(
+                first.as_slice(),
+                [TgCommand::DownloadAvatar { peer: asked, .. }] if asked.id == peer(1).id
+            ),
+            "the header reserved a box, so there is a picture to draw in it: {first:?}"
+        );
+        assert!(
+            second.is_empty(),
+            "the trigger fires on every frame, so `PhotoState` has to hold it down or the avatar \
+             would be fetched four times a second: {second:?}"
+        );
+    }
+
+    /// The defect this trigger was moved to close: with `TGTUI_IMAGES=off`, or on a terminal that
+    /// reported no graphics protocol, the download was spent and every byte discarded.
+    #[test]
+    fn a_terminal_that_cannot_draw_pictures_never_downloads_one() {
+        let (mut app, mut rx) = loaded_app_with_commands();
+        with_profile(&mut app);
+        drain(&mut rx);
+        let mut images = ImageStore::disabled();
+
+        let commands = commands_of_a_frame(&mut app, &mut rx, &mut images);
+
+        assert!(
+            commands.is_empty(),
+            "no way to show it is no reason to fetch it: `reserve` answered `None`, the header \
+             drew initials, and the picture would have been thrown away: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_with_no_picture_asks_for_nothing_however_it_is_drawn() {
+        let (mut app, mut rx) = loaded_app_with_commands();
+        app.open_peer_info(peer(1));
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(user_full("Alice"))),
+        });
+        drain(&mut rx);
+        let mut images = ImageStore::for_tests();
+
+        let commands = commands_of_a_frame(&mut app, &mut rx, &mut images);
+
+        assert!(
+            commands.is_empty(),
+            "there is nothing to fetch, and a request for a picture that does not exist would \
+             come back as an error the user never asked to see: {commands:?}"
         );
     }
 

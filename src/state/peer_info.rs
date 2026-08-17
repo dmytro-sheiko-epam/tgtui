@@ -12,7 +12,7 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use grammers_client::media::Photo;
 use grammers_client::tl;
 
-use crate::state::media::{PhotoRef, avatar_ref};
+use crate::state::media::{Avatar, avatar_ref};
 
 /// A profile, ready to draw.
 #[derive(Debug, Default)]
@@ -24,7 +24,7 @@ pub struct PeerInfo {
     pub about: Option<String>,
     pub rows: Vec<InfoRow>,
     /// The current profile picture. `None` when the peer has none, or has `photoEmpty`.
-    pub avatar: Option<PhotoRef>,
+    pub avatar: Option<Avatar>,
     /// Whether we have blocked this user. `None` for a chat or channel, which have no such flag
     /// about us — `channelFull.blocked` means the channel is restricted, a different fact, and
     /// must never be carried under this name.
@@ -372,6 +372,99 @@ mod tests {
             note: None,
             bot_manager_id: None,
         }
+    }
+
+    /// A `user` as the response's `users` list carries one, with every flag off. The badge tests
+    /// switch on the handful they are about.
+    fn plain_user() -> tl::types::User {
+        tl::types::User {
+            is_self: false,
+            contact: false,
+            mutual_contact: false,
+            deleted: false,
+            bot: false,
+            bot_chat_history: false,
+            bot_nochats: false,
+            verified: false,
+            restricted: false,
+            min: false,
+            bot_inline_geo: false,
+            support: false,
+            scam: false,
+            apply_min_photo: false,
+            fake: false,
+            bot_attach_menu: false,
+            premium: false,
+            attach_menu_enabled: false,
+            bot_can_edit: false,
+            close_friend: false,
+            stories_hidden: false,
+            stories_unavailable: false,
+            contact_require_premium: false,
+            bot_business: false,
+            bot_has_main_app: false,
+            bot_forum_view: false,
+            bot_forum_can_manage_topics: false,
+            bot_can_manage_bots: false,
+            bot_guestchat: false,
+            bot_guard: false,
+            id: 1,
+            access_hash: None,
+            first_name: None,
+            last_name: None,
+            username: None,
+            phone: None,
+            photo: None,
+            status: None,
+            bot_info_version: None,
+            restriction_reason: None,
+            bot_inline_placeholder: None,
+            lang_code: None,
+            emoji_status: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            bot_active_users: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+        }
+    }
+
+    #[test]
+    fn the_badge_line_carries_the_handle_and_every_flag_the_user_wears() {
+        let info = user(
+            &empty_user_full(),
+            Some(&tl::types::User {
+                username: Some("alice".to_string()),
+                bot: true,
+                verified: true,
+                scam: true,
+                fake: true,
+                premium: true,
+                ..plain_user()
+            }),
+        );
+
+        assert_eq!(
+            info.subtitle.first().map(String::as_str),
+            Some("@alice · bot · verified · SCAM · FAKE · premium"),
+            "`SCAM` and `FAKE` are Telegram's own warning labels about who the reader is talking \
+             to; dropping one, or letting the handle and the badges land on separate lines, would \
+             quietly hide a warning the account is entitled to see"
+        );
+    }
+
+    #[test]
+    fn a_user_wearing_no_badges_gets_no_line_rather_than_an_empty_one() {
+        let info = user(&empty_user_full(), Some(&plain_user()));
+
+        assert!(
+            info.subtitle.is_empty(),
+            "an empty subtitle line is a blank row under the name that reads as a failed render, \
+             which is why `subtitle_line` refuses to push one: {:?}",
+            info.subtitle
+        );
     }
 
     #[test]

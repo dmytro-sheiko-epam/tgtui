@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-cargo test                                  # whole suite (301 tests, all unit tests inside src/)
+cargo test                                  # whole suite (347 tests, all unit tests inside src/)
 cargo test scrolling_near_the_top           # one test by substring of its name
 cargo test app::tests                       # one module's tests
 cargo clippy --all-targets
@@ -214,6 +214,22 @@ beyond one for the status banner.
   `ImageStore::reserve`/`prepare` pair sharing `fit` that the transcript uses. A failed download
   falls back to the peer's initials inside the box it already reserved; collapsing the box would
   shove every field below it up at an arbitrary moment.
+- **The picture is fetched by the frame that reserved a box for it.** `peer_view::render` calls
+  `App::request_avatar` only once `header` has a `Size`, the same shape `render_transcript` uses for
+  `request_visible_photos` — no way to show it is no reason to fetch it, so with `TGTUI_IMAGES=off`
+  or on a terminal with no graphics protocol the profile costs no bandwidth. `PhotoState` is the
+  in-flight guard, because the trigger fires again on the very next frame.
+- **An avatar's cache key is the picture, not the peer.** `ImageKey::Avatar` holds
+  `tl::types::Photo.id`, carried on `state::media::Avatar`, because `ImageStore::prepare` serves a
+  `(key, size)` hit without looking at the image. A peer id names whatever they are wearing today,
+  so keying by it would redraw a peer who changed their photo mid-session from the encoding the old
+  one left behind — contradicting the fetched-fresh rule above. `ImageKey::Message` is sound as it
+  stands: a message id names one picture forever, which is the property both variants need.
+- **A menu entry acts on the peer the popup named.** `run_action` hands `menu.peer` to
+  `App::open_peer_info` rather than letting it re-read the selection: `forget_dialog` does not close
+  an open chat menu, so a `DialogGone` arriving while it is up moves the selection to a neighbour.
+  A peer whose row has since gone opens nothing at all — heading a profile with a name resolved from
+  a chat that no longer exists would be a claim about the wrong conversation.
 - **Not every chat-menu entry is a request.** `DialogAction::in_progress` returns an `Option`
   because `Info` only puts a screen up, exactly as `MessageAction::in_progress` does for Reply,
   Edit and Forward. A banner narrating work that is not happening would be a lie about the account.

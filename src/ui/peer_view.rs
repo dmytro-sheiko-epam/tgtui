@@ -43,12 +43,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, images: &mut ImageSt
 
     let (header_rows, avatar_size) = header(view, images, inner.width);
     let lines = body(view, inner.width);
+    let wanted_scroll = view.scroll;
+
+    // No way to show it is no reason to fetch it, the same rule the transcript's photos follow:
+    // with images off, or on a terminal that reported no graphics protocol, `reserve` answers
+    // `None`, no box is drawn, and the download would be bytes thrown away. The renderer is the
+    // only place that knows this, which is why the request lives here rather than in the
+    // `PeerInfoLoaded` reducer — the same shape `render_transcript` uses for
+    // `App::request_visible_photos`. `PhotoState` is the guard, so firing every frame is free.
+    if avatar_size.is_some() {
+        app.request_avatar();
+    }
 
     // Clamped against the profile just measured, the same direction `metrics` and the clamped
     // `ChatBuffer.scroll` already flow: only the frame being built knows how many lines the
     // fields came to.
     let total = header_rows.saturating_add(lines.len() as u16);
-    let scroll = clamp_scroll(view.scroll, total, inner.height);
+    let scroll = clamp_scroll(wanted_scroll, total, inner.height);
     if let Some(view) = app.peer_info.as_mut() {
         view.scroll = scroll;
     }
@@ -82,8 +93,9 @@ fn header(view: &PeerInfoView, images: &ImageStore, width: u16) -> (u16, Option<
         _ => None,
     };
 
-    let size = avatar
-        .and_then(|avatar| images.reserve(avatar.pixels, AVATAR_COLS.min(width), AVATAR_ROWS));
+    let size = avatar.and_then(|avatar| {
+        images.reserve(avatar.picture.pixels, AVATAR_COLS.min(width), AVATAR_ROWS)
+    });
 
     // One line for the name, one per subtitle line, and a blank line under the lot.
     let text_rows = 1 + subtitles(view).len() as u16 + 1;
@@ -182,15 +194,16 @@ fn draw_avatar(
         return;
     }
 
-    if let Some(image) = avatar.image() {
-        let peer = view.peer.id;
+    if let Some(image) = avatar.picture.image() {
+        // Keyed by the picture, not by the peer: see `ImageKey`.
+        let key = ImageKey::Avatar(avatar.id);
         if images
-            .prepare(ImageKey::Avatar(peer), image, size.width, size.height)
+            .prepare(key, image, size.width, size.height)
             .is_some()
             // Looked up at the *reserved* size rather than at whatever `prepare` just returned:
             // the reserved box is what the header was measured against, so a picture that encoded
             // to some other size must go undrawn rather than move the fields under the reader.
-            && let Some(protocol) = images.protocol(ImageKey::Avatar(peer), size)
+            && let Some(protocol) = images.protocol(key, size)
         {
             // Sliced from above, so the rows of the picture that have scrolled past the top are
             // the ones dropped rather than the ones at the bottom.
