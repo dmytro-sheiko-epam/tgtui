@@ -82,6 +82,15 @@ pub enum TgCommand {
         destination: PeerRef,
     },
 
+    /// Read everything Telegram will say about one peer.
+    ///
+    /// Which of the three full-info calls this becomes is decided from the peer's own kind, so
+    /// nothing else has to be carried. Unlike the chat actions below this changes nothing about
+    /// the account, which is why it needs no confirmation and reports no progress.
+    LoadPeerInfo {
+        peer: PeerRef,
+    },
+
     // -- chat actions --------------------------------------------------------
     //
     // Every one of these changes the account's real state and is visible on the user's other

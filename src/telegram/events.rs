@@ -8,6 +8,7 @@ use image::DynamicImage;
 use crate::state::chat_buffer::{ChatMessage, ReplyPreview};
 use crate::state::dialog_list::DialogSummary;
 use crate::state::folders::Folder;
+use crate::state::peer_info::PeerInfo;
 
 #[derive(Debug)]
 pub enum TgEvent {
@@ -110,6 +111,20 @@ pub enum TgEvent {
         peer: PeerId,
         still_unread: i32,
     },
+    /// A peer's profile, for the info screen.
+    ///
+    /// Boxed for the reason `TgCommand::DownloadPhoto` boxes its source: inline, a whole profile
+    /// would make every event in this channel as large as the largest one.
+    ///
+    /// `Err` carries what to print in place of the fields. A profile can be refused outright —
+    /// privacy settings, a channel we have been kicked from — and the screen has to leave its
+    /// loading state either way, so the failure travels in the same event rather than in the
+    /// status banner, which is transient and would be gone before the user read it.
+    PeerInfoLoaded {
+        peer: PeerId,
+        info: Result<Box<PeerInfo>, String>,
+    },
+
     // -- chat actions --------------------------------------------------------
     //
     // Applied when the server confirms, never optimistically: a mute that silently failed but

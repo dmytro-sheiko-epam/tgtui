@@ -13,6 +13,7 @@ use crate::state::dialog_actions::{DialogAction, DialogKind, actions_for};
 use crate::state::dialog_list::DialogListState;
 use crate::state::media::{PhotoRef, PhotoSource, PhotoState};
 use crate::state::message_actions::{self, MessageAction};
+use crate::state::peer_info::PeerInfo;
 use crate::telegram::{TgCommand, TgEvent};
 
 /// How long a status banner stays on screen before it fades away.
@@ -142,6 +143,31 @@ pub struct ForwardPicker {
     pub selected: usize,
 }
 
+/// A profile being read.
+///
+/// Fetched fresh on every open and dropped on close: there is no cache of profiles anywhere, so
+/// there is no second staleness problem to reason about. A bio edited on another device simply
+/// arrives the next time the screen is opened.
+pub struct PeerInfoView {
+    /// Kept for the avatar download, which needs the access hash.
+    pub peer: PeerRef,
+    /// From the dialog row, so the title is right before the fetch lands.
+    pub name: String,
+    pub kind: DialogKind,
+    pub state: InfoState,
+    /// Lines scrolled *past the top*. The opposite of `ChatBuffer.scroll`, which counts up from
+    /// the bottom — deliberately, because a profile is a fixed-length document read top-down,
+    /// while a transcript grows at the end and must not move when older history is prepended.
+    pub scroll: u16,
+}
+
+#[derive(Debug)]
+pub enum InfoState {
+    Loading,
+    Ready(Box<PeerInfo>),
+    Failed(String),
+}
+
 pub struct App {
     pub screen: Screen,
     /// Text being typed on whichever login screen is active.
@@ -172,6 +198,9 @@ pub struct App {
     /// Picking a destination for a forward. Modal, and outranks both menus — by the time it is up
     /// the menu that opened it has closed.
     pub forward: Option<ForwardPicker>,
+    /// The profile being read. Modal and full screen, like `viewer`: while it is set the two
+    /// panes are not drawn at all.
+    pub peer_info: Option<PeerInfoView>,
     /// The cursor moved and the transcript has not been redrawn yet, so it may be off screen.
     /// Consumed by `chat_view::render_transcript`, which is the only code that knows where a
     /// message sits in lines.
@@ -208,6 +237,7 @@ impl App {
             menu: None,
             message_menu: None,
             forward: None,
+            peer_info: None,
             scroll_to_selection: false,
             image_rows: None,
             visible_photos: Vec::new(),
@@ -439,6 +469,31 @@ impl App {
                 self.set_status("history cleared", StatusKind::Info);
             }
             TgEvent::DialogGone { peer, reason } => self.forget_dialog(peer, reason),
+
+            TgEvent::PeerInfoLoaded { peer, info } => {
+                // A late answer must not land on the wrong profile: the screen may have been
+                // closed and reopened on another chat entirely while this was in flight.
+                if self.peer_info.as_ref().map(|view| view.peer.id) != Some(peer) {
+                    return;
+                }
+
+                let state = match info {
+                    Ok(info) => {
+                        // A server answer for this one peer, and a fresher one than the single
+                        // page of `contacts.getBlocked` the flag is otherwise seeded from. Not
+                        // optimism — the same rule the chat actions follow.
+                        if let Some(blocked) = info.blocked {
+                            self.dialogs.set_blocked(peer, blocked);
+                        }
+                        InfoState::Ready(info)
+                    }
+                    Err(why) => InfoState::Failed(why),
+                };
+
+                if let Some(view) = self.peer_info.as_mut() {
+                    view.state = state;
+                }
+            }
 
             TgEvent::OutgoingRead { peer, max_id } => self.dialogs.mark_outbox_read(peer, max_id),
             TgEvent::IncomingRead { peer, still_unread } => self
@@ -822,6 +877,28 @@ impl App {
                 source: Box::new(source),
             });
         }
+    }
+
+    // -- the profile screen ---------------------------------------------------
+
+    /// Open the selected conversation's profile and ask for it.
+    ///
+    /// Nothing is applied locally and nothing is assumed: the screen goes up in its loading state
+    /// and the fields arrive when the server answers.
+    pub fn open_peer_info(&mut self) {
+        let Some(summary) = self.dialogs.selected_summary() else {
+            return self.set_status("no chat selected", StatusKind::Info);
+        };
+
+        let peer = summary.peer;
+        self.peer_info = Some(PeerInfoView {
+            peer,
+            name: summary.name.clone(),
+            kind: summary.kind,
+            state: InfoState::Loading,
+            scroll: 0,
+        });
+        self.send(TgCommand::LoadPeerInfo { peer });
     }
 
     // -- the chat action menu ------------------------------------------------
@@ -1389,10 +1466,11 @@ mod tests {
     use super::*;
     use crate::state::chat_buffer::{PAGE_SIZE, ReplyPreview};
     use crate::state::dialog_list::FolderTab;
+    use crate::state::peer_info::PeerInfo;
     use crate::telegram::TgEvent;
     use crate::test_support::{
         app, archived_dialog, channel, channel_dialog, dialog, drain, folder, gradient,
-        group_dialog, message, outgoing, page, peer, photo_message,
+        group_dialog, message, outgoing, page, peer, photo_message, user_full,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1414,6 +1492,96 @@ mod tests {
         });
         drain(&mut rx);
         (app, rx)
+    }
+
+    /// The selected chat's profile, opened and answered.
+    fn opened_profile() -> (App, mpsc::UnboundedReceiver<TgCommand>) {
+        let (mut app, rx) = opened_chat();
+        app.open_peer_info();
+        (app, rx)
+    }
+
+    #[test]
+    fn opening_a_profile_asks_for_it_and_shows_the_name_while_it_waits() {
+        let (mut app, mut rx) = opened_chat();
+        app.open_peer_info();
+
+        let view = app.peer_info.as_ref().expect("the screen is open");
+        assert_eq!(
+            view.name, "Alice",
+            "the name comes off the dialog row, so the title is right before the fetch lands"
+        );
+        assert!(matches!(view.state, InfoState::Loading));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::LoadPeerInfo { peer: asked }] if asked.id == peer(1).id
+        ));
+    }
+
+    #[test]
+    fn a_profile_that_arrives_replaces_the_loading_state() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(user_full("Alice"))),
+        });
+
+        let InfoState::Ready(info) = &app.peer_info.as_ref().unwrap().state else {
+            panic!("the profile should be ready");
+        };
+        assert_eq!(info.about.as_deref(), Some("This is Alice."));
+    }
+
+    #[test]
+    fn a_failed_profile_fetch_leaves_the_loading_state_and_says_why() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Err("could not read this profile: CHANNEL_PRIVATE".to_string()),
+        });
+
+        match &app.peer_info.as_ref().unwrap().state {
+            InfoState::Failed(why) => assert!(why.contains("CHANNEL_PRIVATE")),
+            other => panic!(
+                "a screen stuck on `Loading` forever is worse than one that says what went \
+                 wrong, but got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn an_answer_for_another_peer_is_dropped() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(2).id,
+            info: Ok(Box::new(user_full("Bob"))),
+        });
+
+        assert!(
+            matches!(app.peer_info.as_ref().unwrap().state, InfoState::Loading),
+            "a slow answer for a profile the user has already closed and reopened elsewhere must \
+             not land on whichever one happens to be on screen"
+        );
+    }
+
+    #[test]
+    fn a_profile_correcting_the_blocked_flag_updates_the_dialog_row() {
+        let (mut app, _rx) = opened_profile();
+        assert!(!app.dialogs.find(peer(1).id).unwrap().blocked);
+
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(PeerInfo {
+                blocked: Some(true),
+                ..user_full("Alice")
+            })),
+        });
+
+        assert!(
+            app.dialogs.find(peer(1).id).unwrap().blocked,
+            "the seed is one page of `contacts.getBlocked`, so past it a blocked user shows \
+             `Block`; the profile is a fresher server answer for this one peer"
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ use crate::state::chat_buffer::{self, ChatMessage, ReplyPreview};
 use crate::state::dialog_list::{self, DialogSummary};
 use crate::state::folders::Folder;
 use crate::state::media::{self, PhotoSource};
+use crate::state::peer_info::{self, PeerInfo};
 
 /// The archive. Folder 0 is the main list; there are no other folders in the API.
 const ARCHIVE_FOLDER: i32 = 1;
@@ -128,6 +129,7 @@ async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCo
             TgCommand::LoadMoreDialogs { archived: false } => actor.load_more_dialogs(),
             TgCommand::LoadMoreDialogs { archived: true } => actor.load_more_archived(),
             TgCommand::LoadFolders => actor.load_folders(),
+            TgCommand::LoadPeerInfo { peer } => actor.load_peer_info(peer),
             TgCommand::OpenChat { peer } => actor.open_chat(peer),
             TgCommand::LoadOlderMessages { peer, before_id } => {
                 actor.load_older_messages(peer, before_id)
@@ -832,6 +834,30 @@ impl Actor {
             let _ = events.send(TgEvent::BlockedPeersLoaded { peers });
         });
     }
+
+    /// Read a peer's full profile.
+    ///
+    /// grammers 0.10 wraps none of the three calls, so all three are raw — the same path
+    /// `messages.getDialogFilters` and the archive's `messages.getDialogs` already take.
+    ///
+    /// `PeerKind`'s three variants line up one-to-one with the three requests, and a megagroup
+    /// takes the channel one correctly because it *is* a `Channel`. That is the whole dispatch;
+    /// nothing has to be carried on the command to disambiguate.
+    fn load_peer_info(&mut self, peer: PeerRef) {
+        let client = self.client.clone();
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            let info = fetch_peer_info(&client, peer)
+                .await
+                .map_err(|err| format!("could not read this profile: {err}"));
+
+            let _ = events.send(TgEvent::PeerInfoLoaded {
+                peer: peer.id,
+                info,
+            });
+        });
+    }
 }
 
 /// Fetch one page of history, newest first. `before_id` pages backwards through the chat.
@@ -878,6 +904,53 @@ async fn fetch_image(client: &Client, source: &PhotoSource) -> Result<DynamicIma
     tokio::task::spawn_blocking(move || image::load_from_memory(&bytes))
         .await?
         .map_err(Into::into)
+}
+
+async fn fetch_peer_info(client: &Client, peer: PeerRef) -> Result<Box<PeerInfo>, InvocationError> {
+    let info = match peer.id.kind() {
+        PeerKind::User => {
+            let tl::enums::users::UserFull::Full(answer) = client
+                .invoke(&tl::functions::users::GetFullUser { id: (&peer).into() })
+                .await?;
+            let tl::enums::UserFull::Full(full) = answer.full_user;
+
+            // The handle, phone and badges are on the `User` rather than the `UserFull`, and the
+            // response carries both. Matching on the id rather than taking the first entry
+            // because `users` also carries anyone the profile mentions.
+            let bare = peer.id.bare_id_unchecked();
+            let user = answer.users.iter().find_map(|user| match user {
+                tl::enums::User::User(user) if user.id == bare => Some(user),
+                _ => None,
+            });
+            peer_info::user(&full, user)
+        }
+        PeerKind::Chat => {
+            let tl::enums::messages::ChatFull::Full(answer) = client
+                .invoke(&tl::functions::messages::GetFullChat {
+                    chat_id: peer.id.bare_id_unchecked(),
+                })
+                .await?;
+            match answer.full_chat {
+                tl::enums::ChatFull::Full(full) => peer_info::chat(&full),
+                // Cannot happen — `messages.getFullChat` answers for basic groups only — but a
+                // panic here would take down the whole client for one profile.
+                tl::enums::ChatFull::ChannelFull(full) => peer_info::channel(&full),
+            }
+        }
+        PeerKind::Channel => {
+            let tl::enums::messages::ChatFull::Full(answer) = client
+                .invoke(&tl::functions::channels::GetFullChannel {
+                    channel: (&peer).into(),
+                })
+                .await?;
+            match answer.full_chat {
+                tl::enums::ChatFull::ChannelFull(full) => peer_info::channel(&full),
+                tl::enums::ChatFull::Full(full) => peer_info::chat(&full),
+            }
+        }
+    };
+
+    Ok(Box::new(info))
 }
 
 /// Point the archive cursor just past the last row of a page.

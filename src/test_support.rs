@@ -15,6 +15,7 @@ use crate::state::dialog_actions::DialogKind;
 use crate::state::dialog_list::DialogSummary;
 use crate::state::folders::{Folder, FolderRule};
 use crate::state::media::{PhotoState, photo_ref};
+use crate::state::peer_info::{InfoRow, PeerInfo};
 use crate::telegram::TgCommand;
 
 pub fn peer(id: i64) -> PeerRef {
@@ -490,6 +491,20 @@ pub fn raw_folder() -> tl::enums::Dialog {
         unread_muted_messages_count: 0,
         unread_unmuted_messages_count: 7,
     })
+}
+
+/// A profile as the actor would deliver one, with a bio and nothing else.
+pub fn user_full(name: &str) -> PeerInfo {
+    PeerInfo {
+        subtitle: vec![format!("@{}", name.to_lowercase())],
+        about: Some(format!("This is {name}.")),
+        rows: vec![InfoRow {
+            label: "Peer id",
+            value: "1".to_string(),
+        }],
+        avatar: None,
+        blocked: None,
+    }
 }
 
 /// An app plus the receiving end of the commands it issues.

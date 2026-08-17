@@ -25,6 +25,10 @@ pub struct PeerInfo {
     pub rows: Vec<InfoRow>,
     /// The current profile picture. `None` when the peer has none, or has `photoEmpty`.
     pub avatar: Option<PhotoRef>,
+    /// Whether we have blocked this user. `None` for a chat or channel, which have no such flag
+    /// about us — `channelFull.blocked` means the channel is restricted, a different fact, and
+    /// must never be carried under this name.
+    pub blocked: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +80,7 @@ fn thousands(count: i32) -> String {
 pub fn user(full: &tl::types::UserFull, user: Option<&tl::types::User>) -> PeerInfo {
     let mut info = PeerInfo {
         about: full.about.clone().filter(|about| !about.is_empty()),
+        blocked: Some(full.blocked),
         ..PeerInfo::default()
     };
 
@@ -649,6 +654,27 @@ mod tests {
         assert!(
             info.subtitle.is_empty(),
             "the server refused the list; a zero there would be inventing a fact about the group"
+        );
+    }
+
+    #[test]
+    fn only_a_user_profile_reports_whether_we_have_blocked_them() {
+        assert_eq!(
+            user(
+                &tl::types::UserFull {
+                    blocked: true,
+                    ..empty_user_full()
+                },
+                None
+            )
+            .blocked,
+            Some(true)
+        );
+        assert_eq!(
+            channel(&empty_channel_full()).blocked,
+            None,
+            "`channelFull.blocked` means the channel is restricted, not that we blocked it; \
+             carrying it under the same name would put a Unblock entry on a chat menu"
         );
     }
 
