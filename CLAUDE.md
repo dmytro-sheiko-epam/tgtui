@@ -201,6 +201,22 @@ beyond one for the status banner.
   short whether or not the message has been read, so a receipt changing from ✓ to ✓✓ cannot change
   a message's line count and therefore cannot move `scroll` under the reader. Same discipline as
   `ImageStore::reserve`/`prepare` sharing `fit`.
+- **The info screen scrolls from the top; the transcript scrolls from the bottom.** A profile is a
+  fixed-length document read top-down, so `PeerInfoView.scroll` counts lines scrolled *past* and
+  `peer_view::clamp_scroll` bounds it against the profile the frame just measured. `ChatBuffer.scroll`
+  counts *up from the newest message* instead, so prepending older history does not move the
+  viewport. The two look alike and mean opposite things.
+- **A profile is fetched fresh and never cached.** `App.peer_info` is dropped on close, so there is
+  no second staleness problem: a bio edited on another device simply arrives next time. It also
+  means a late `PeerInfoLoaded` or `AvatarLoaded` must be dropped when its peer is not the one on
+  screen, and that a profile must not outlive its conversation — `forget_dialog` clears it.
+- **The avatar claims its rows before it arrives, and keeps them if it never does.** Same
+  `ImageStore::reserve`/`prepare` pair sharing `fit` that the transcript uses. A failed download
+  falls back to the peer's initials inside the box it already reserved; collapsing the box would
+  shove every field below it up at an arbitrary moment.
+- **Not every chat-menu entry is a request.** `DialogAction::in_progress` returns an `Option`
+  because `Info` only puts a screen up, exactly as `MessageAction::in_progress` does for Reply,
+  Edit and Forward. A banner narrating work that is not happening would be a lie about the account.
 
 ## Scope
 
@@ -240,6 +256,18 @@ megagroup's would be `channels.deleteHistory` (admin-only, and destructive for e
 is nobody to block in a group. `client.mark_as_read` exists in grammers and is deliberately never
 called; see the read-state paragraph below.
 
+`Ctrl+A` also opens `Info`, the one entry in that menu that asks nothing of the account: a
+full-screen, read-only profile of the conversation. A user shows their handle and badges, presence,
+bio, phone, birthday and how many groups you share; a basic group shows its description and member
+count; a megagroup or channel adds online and admin counts and slow mode. `state::peer_info` is the
+table, and the reasoning behind each omission is in the tests there — an invite link is a
+credential, a linked chat arrives as a bare id worth neither printing nor a second request to
+resolve, and the layer's ornaments (wallpapers, gift counts, star ratings) have nothing to do with
+reading a conversation from a terminal. grammers 0.10 wraps none of `users.getFullUser`,
+`messages.getFullChat` or `channels.getFullChannel`, so all three are raw `invoke`s; `PeerKind`'s
+three variants pick between them exactly. Editing anything about a peer, listing participants, and
+opening the avatar in the picture viewer are out of scope.
+
 The chat list is a strip of folder tabs over one pool of dialogs: `All`, the account's own folders,
 then `Archive`. `Ctrl+O` and `Ctrl+E` step through them, wrapping.
 
@@ -275,18 +303,22 @@ Keys: `Ctrl+P` opens the newest picture on screen full screen — a modifier bec
 character goes into the compose box — then `←`/`→` step through the chat's pictures and `Esc`
 closes. Stepping clamps at either end rather than wrapping. `Ctrl+A`, a modifier for the same
 reason, opens the action menu on the selected chat: `↑`/`↓` and `Enter` pick, `Esc` closes, and the
-entries that cannot be undone from that screen ask `y`/`n` first. `Ctrl+S` puts a cursor on the
+entries that cannot be undone from that screen ask `y`/`n` first. `Info` in that menu opens the
+profile full screen, where `↑`/`↓` scroll and `Esc` closes. `Ctrl+S` puts a cursor on the
 newest message in the transcript, where `↑`/`↓` walk it (clamping, like the viewer), `Enter` opens
 that message's menu and `Esc` gives the keyboard back to the compose box. `Ctrl+S` is safe to
 claim despite being XOFF because `ratatui::init` enables raw mode, which clears `IXON`. `Ctrl+O`
 and `Ctrl+E` step forwards and backwards through the folder tabs; unlike the viewer's `←`/`→` they
 wrap, because the strip is a ring whose ends are both on screen.
 
-Four modals stack, and the order in `handle_main_key` is deliberate: viewer, forward picker,
-chat menu, message menu, message cursor. The viewer is first because it is full screen and nothing
-behind it is visible. The forward picker is next because it takes plain characters into its filter,
-so it must be claimed ahead of the menus that navigate with `j`/`k`. Everything modal comes before
-the compose box, which otherwise swallows every letter.
+Five modals stack, and the order in `handle_main_key` is deliberate: viewer, peer info, forward
+picker, chat menu, message menu, message cursor. The viewer is first because it is full screen and
+nothing behind it is visible; the info screen is second for the same reason. The forward picker is
+next because it takes plain characters into its filter, so it must be claimed ahead of the menus
+that navigate with `j`/`k`. Everything modal comes before the compose box, which otherwise swallows
+every letter. The viewer and the info screen can never both be open: with a picture up the chat
+list is not drawn, so `Ctrl+A` is unreachable and no `Info` entry can be chosen; with a profile up,
+`handle_peer_info_key` swallows `Ctrl+P`.
 
 Pictures live in memory only and are never written to disk — the data directory is locked down
 for the session key, and chat photos have no business outliving the process. `state::media`

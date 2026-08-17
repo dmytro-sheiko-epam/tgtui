@@ -98,7 +98,6 @@ pub struct PeerInfoView {
     pub peer: PeerRef,
     /// From the dialog row, so the title is right before the fetch lands.
     pub name: String,
-    pub kind: DialogKind,
     pub state: InfoState,
     /// Lines scrolled past the top of the profile. See the scroll-direction invariant.
     pub scroll: u16,
