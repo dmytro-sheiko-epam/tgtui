@@ -462,7 +462,7 @@ mod tests {
         let mut app = loaded_app();
         with_menu(&mut app);
         // Walk to "Delete chat", the last entry, and pick it.
-        for _ in 0..5 {
+        for _ in 0..6 {
             app.handle_key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Down,
                 crossterm::event::KeyModifiers::empty(),

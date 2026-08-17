@@ -53,6 +53,9 @@ impl DialogKind {
 /// One entry in the chat action menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogAction {
+    /// Show what Telegram will say about this peer. Alone among these entries it asks nothing of
+    /// the account and changes nothing on any other device — it only puts a screen up.
+    Info,
     Mute,
     Unmute,
     Pin,
@@ -72,6 +75,7 @@ pub enum DialogAction {
 impl DialogAction {
     pub fn label(self, kind: DialogKind) -> &'static str {
         match self {
+            DialogAction::Info => "Info",
             DialogAction::Mute => "Mute",
             DialogAction::Unmute => "Unmute",
             DialogAction::Pin => "Pin to top",
@@ -102,18 +106,22 @@ impl DialogAction {
     }
 
     /// What the status banner says while the request is in flight.
-    pub fn in_progress(self) -> &'static str {
+    ///
+    /// `None` means the entry aims the UI rather than issuing a request — the same shape
+    /// `MessageAction::in_progress` already has for Reply, Edit and Forward.
+    pub fn in_progress(self) -> Option<&'static str> {
         match self {
-            DialogAction::Mute => "muting…",
-            DialogAction::Unmute => "unmuting…",
-            DialogAction::Pin => "pinning…",
-            DialogAction::Unpin => "unpinning…",
-            DialogAction::Archive => "archiving…",
-            DialogAction::Unarchive => "unarchiving…",
-            DialogAction::ClearHistory => "clearing history…",
-            DialogAction::Block => "blocking…",
-            DialogAction::Unblock => "unblocking…",
-            DialogAction::DeleteOrLeave => "leaving…",
+            DialogAction::Info => None,
+            DialogAction::Mute => Some("muting…"),
+            DialogAction::Unmute => Some("unmuting…"),
+            DialogAction::Pin => Some("pinning…"),
+            DialogAction::Unpin => Some("unpinning…"),
+            DialogAction::Archive => Some("archiving…"),
+            DialogAction::Unarchive => Some("unarchiving…"),
+            DialogAction::ClearHistory => Some("clearing history…"),
+            DialogAction::Block => Some("blocking…"),
+            DialogAction::Unblock => Some("unblocking…"),
+            DialogAction::DeleteOrLeave => Some("leaving…"),
         }
     }
 
@@ -147,6 +155,7 @@ pub fn actions_for(
     archived: bool,
 ) -> Vec<DialogAction> {
     let mut actions = vec![
+        DialogAction::Info,
         if muted {
             DialogAction::Unmute
         } else {
@@ -210,6 +219,7 @@ mod tests {
         assert_eq!(
             labels(PERSON, false, false, false),
             [
+                "Info",
                 "Mute",
                 "Pin to top",
                 "Archive",
@@ -225,6 +235,7 @@ mod tests {
         assert_eq!(
             labels(BASIC_GROUP, false, false, false),
             [
+                "Info",
                 "Mute",
                 "Pin to top",
                 "Archive",
@@ -242,7 +253,7 @@ mod tests {
     fn a_megagroup_is_left_like_a_group_but_offers_no_clear_history() {
         assert_eq!(
             labels(MEGAGROUP, false, false, false),
-            ["Mute", "Pin to top", "Archive", "Leave group",]
+            ["Info", "Mute", "Pin to top", "Archive", "Leave group",]
         );
     }
 
@@ -250,7 +261,7 @@ mod tests {
     fn a_channel_is_left_and_has_no_history_of_yours_to_clear() {
         assert_eq!(
             labels(DialogKind::Channel, false, false, false),
-            ["Mute", "Pin to top", "Archive", "Leave channel",],
+            ["Info", "Mute", "Pin to top", "Archive", "Leave channel",],
             "the history in a broadcast channel belongs to the channel; there is no copy of it \
              that clearing could empty"
         );
@@ -284,8 +295,8 @@ mod tests {
             assert_eq!(seen.len(), menu.len(), "duplicate entry in {menu:?}");
             assert_eq!(
                 menu.len(),
-                6,
-                "the private-chat menu is six entries whichever way the toggles sit: {menu:?}"
+                7,
+                "the private-chat menu is seven entries whichever way the toggles sit: {menu:?}"
             );
         }
     }
@@ -359,5 +370,33 @@ mod tests {
             !DialogKind::Channel.receipts_make_sense(),
             "a broadcast channel has readers, not a recipient"
         );
+    }
+
+    #[test]
+    fn every_conversation_offers_info_and_offers_it_first() {
+        for kind in [PERSON, SAVED, BASIC_GROUP, MEGAGROUP, DialogKind::Channel] {
+            let menu = actions_for(kind, false, false, false, false);
+            assert_eq!(
+                menu.first(),
+                Some(&DialogAction::Info),
+                "the order runs reversible-first and destructive-last so a mistyped Enter lands \
+                 somewhere harmless; Info changes nothing at all, so it belongs at the top"
+            );
+        }
+    }
+
+    #[test]
+    fn info_is_the_one_entry_that_asks_nothing_of_the_server() {
+        assert_eq!(
+            DialogAction::Info.in_progress(),
+            None,
+            "every other entry is a request whose progress the banner narrates; Info only puts a \
+             screen up, so a banner would be reporting work that is not happening"
+        );
+        assert!(!DialogAction::Info.is_destructive());
+
+        for action in [DialogAction::Mute, DialogAction::Block, DialogAction::Pin] {
+            assert!(action.in_progress().is_some());
+        }
     }
 }

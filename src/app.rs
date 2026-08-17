@@ -555,6 +555,15 @@ impl App {
         }
         self.chats.remove(&peer);
 
+        // A profile of a conversation that no longer exists is a screen with nothing behind it.
+        if self
+            .peer_info
+            .as_ref()
+            .is_some_and(|view| view.peer.id == peer)
+        {
+            self.peer_info = None;
+        }
+
         // The chat pane may be showing a conversation that is no longer in the list. `remove` has
         // already left the selection somewhere valid, so following it is enough — and the compose
         // box has to be emptied, or a half-typed line would be sent into the next chat.
@@ -666,6 +675,17 @@ impl App {
                 return self.toggle_viewer();
             }
             return self.handle_viewer_key(key);
+        }
+
+        // Full screen like the viewer, and claimed right behind it for the same reason: while it
+        // is up neither pane is drawn, so nothing behind it is reachable and nothing it swallows
+        // can leak into the compose box.
+        //
+        // The two can never both be open. With a picture up the chat list is not drawn, so
+        // `Ctrl+A` is unreachable and no `Info` entry can be chosen; with a profile up, the
+        // handler below swallows `Ctrl+P`.
+        if self.peer_info.is_some() {
+            return self.handle_peer_info_key(key);
         }
 
         // The picker takes plain characters into its filter, so it has to be claimed before either
@@ -969,7 +989,15 @@ impl App {
         };
         let peer = menu.peer;
 
+        // Not every entry is a request. Info only puts a screen up — the same way the message
+        // menu's Reply and Edit only aim the compose box — which is why `in_progress` is an
+        // `Option` and why this returns before reaching the channel.
+        if action == DialogAction::Info {
+            return self.open_peer_info();
+        }
+
         self.send(match action {
+            DialogAction::Info => unreachable!("handled above, before the menu was consumed"),
             DialogAction::Mute => TgCommand::SetMuted { peer, muted: true },
             DialogAction::Unmute => TgCommand::SetMuted { peer, muted: false },
             DialogAction::Pin => TgCommand::SetPinned { peer, pinned: true },
@@ -997,7 +1025,9 @@ impl App {
             DialogAction::DeleteOrLeave => TgCommand::DeleteDialog { peer },
         });
 
-        self.set_status(action.in_progress(), StatusKind::Info);
+        if let Some(progress) = action.in_progress() {
+            self.set_status(progress, StatusKind::Info);
+        }
     }
 
     // -- the message cursor --------------------------------------------------
@@ -1293,6 +1323,25 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.viewer = None,
             KeyCode::Left | KeyCode::Char('h') => self.step_viewer(-1),
             KeyCode::Right | KeyCode::Char('l') => self.step_viewer(1),
+            _ => {}
+        }
+    }
+
+    /// The profile screen's keys: scroll, and close.
+    ///
+    /// Everything else is swallowed rather than falling through, which is what makes this modal.
+    /// The renderer clamps `scroll` against the profile it just measured, the same way
+    /// `render_transcript` clamps `ChatBuffer.scroll` — only the frame just built knows how many
+    /// lines the fields came to.
+    fn handle_peer_info_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.peer_info.as_mut() else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc => self.peer_info = None,
+            KeyCode::Down | KeyCode::Char('j') => view.scroll = view.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
             _ => {}
         }
     }
@@ -3411,6 +3460,81 @@ mod tests {
     }
 
     #[test]
+    fn choosing_info_from_the_chat_menu_opens_the_profile() {
+        let (mut app, mut rx) = opened_chat();
+        app.handle_key(ctrl(KeyCode::Char('a')));
+        // Info is the first entry, so the menu opens on it.
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            app.menu.is_none(),
+            "the menu closes behind the screen it opened"
+        );
+        assert!(app.peer_info.is_some());
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::LoadPeerInfo { .. }]
+        ));
+    }
+
+    #[test]
+    fn the_info_screen_swallows_ctrl_p_so_the_viewer_cannot_open_behind_it() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_key(ctrl(KeyCode::Char('p')));
+
+        assert!(
+            app.viewer.is_none(),
+            "with the profile full screen the transcript is not drawn, so a picture opened from \
+             it would be chosen from something nobody can see"
+        );
+        assert!(app.peer_info.is_some());
+    }
+
+    #[test]
+    fn typing_while_a_profile_is_open_does_not_reach_the_compose_box() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert!(
+            app.compose.is_empty(),
+            "every modal is claimed before the compose box, which otherwise swallows every letter"
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_profile_and_forgets_it() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.peer_info.is_none());
+    }
+
+    #[test]
+    fn deleting_the_chat_closes_its_info_screen() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_event(TgEvent::DialogGone {
+            peer: peer(1).id,
+            reason: "deleted",
+        });
+
+        assert!(
+            app.peer_info.is_none(),
+            "a profile of a conversation that no longer exists is a screen with nothing behind it"
+        );
+    }
+
+    #[test]
+    fn deleting_another_chat_leaves_an_open_profile_alone() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_event(TgEvent::DialogGone {
+            peer: peer(2).id,
+            reason: "deleted",
+        });
+
+        assert!(app.peer_info.is_some());
+    }
+
+    #[test]
     fn a_group_offers_leave_rather_than_delete() {
         let (mut app, _rx) = app();
         app.handle_event(TgEvent::Authorized(true));
@@ -3736,8 +3860,7 @@ mod tests {
         assert!(menu_labels(&app).contains(&"Unarchive"));
         assert!(!menu_labels(&app).contains(&"Archive"));
 
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Down));
+        select_action(&mut app, "Unarchive");
         app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(
