@@ -304,24 +304,9 @@ mod tests {
         assert_eq!(media_label(&media), "[file]");
     }
 
-    /// A profile photo as `users.getFullUser` delivers one: a bare `tl::enums::Photo` rather than
-    /// the `MessageMediaPhoto` a message carries.
-    fn profile_photo(sizes: &[tl::enums::PhotoSize]) -> grammers_client::media::Photo {
-        grammers_client::media::Photo::from_raw(tl::enums::Photo::Photo(tl::types::Photo {
-            has_stickers: false,
-            id: 1,
-            access_hash: 1,
-            file_reference: Vec::new(),
-            date: 0,
-            sizes: sizes.to_vec(),
-            video_sizes: None,
-            dc_id: 2,
-        }))
-    }
-
     #[test]
     fn an_avatar_picks_a_thumbnail_the_same_way_a_message_photo_does() {
-        let avatar = avatar_ref(&profile_photo(&[
+        let avatar = avatar_ref(&crate::test_support::profile_photo(&[
             crate::test_support::thumb("a", 160, 160),
             crate::test_support::thumb("x", 640, 640),
         ]))

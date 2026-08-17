@@ -124,6 +124,13 @@ pub enum TgEvent {
         peer: PeerId,
         info: Result<Box<PeerInfo>, String>,
     },
+    /// The profile picture finished downloading. `None` when it failed — reported in the success
+    /// shape for the reason `PhotoLoaded` is: the in-flight guard has to clear either way, and
+    /// the screen falls back to the peer's initials.
+    AvatarLoaded {
+        peer: PeerId,
+        image: Option<Arc<DynamicImage>>,
+    },
 
     // -- chat actions --------------------------------------------------------
     //

@@ -493,6 +493,32 @@ impl App {
                 if let Some(view) = self.peer_info.as_mut() {
                     view.state = state;
                 }
+
+                // Requested here rather than from the renderer, unlike the transcript's photos:
+                // there is exactly one avatar and it is on screen the moment the profile is, so
+                // there is nothing for a visibility trigger to decide. `PhotoState` is still the
+                // guard, so a second answer for the same screen changes nothing.
+                self.request_avatar();
+            }
+
+            TgEvent::AvatarLoaded { peer, image } => {
+                // Same stale guard as the profile itself: the screen may have moved on.
+                let Some(view) = self.peer_info.as_mut().filter(|view| view.peer.id == peer) else {
+                    return;
+                };
+                let InfoState::Ready(info) = &mut view.state else {
+                    return;
+                };
+                let Some(avatar) = info.avatar.as_mut() else {
+                    return;
+                };
+
+                // `Failed` is terminal. Nothing retries it, because the picture is asked for once
+                // and the screen has initials to fall back to.
+                avatar.state = match image {
+                    Some(image) => PhotoState::Ready(image),
+                    None => PhotoState::Failed,
+                };
             }
 
             TgEvent::OutgoingRead { peer, max_id } => self.dialogs.mark_outbox_read(peer, max_id),
@@ -919,6 +945,29 @@ impl App {
             scroll: 0,
         });
         self.send(TgCommand::LoadPeerInfo { peer });
+    }
+
+    /// Fetch the open profile's picture, if it has one that has not been asked for yet.
+    fn request_avatar(&mut self) {
+        let Some(view) = self.peer_info.as_mut() else {
+            return;
+        };
+        let InfoState::Ready(info) = &mut view.state else {
+            return;
+        };
+        let Some(avatar) = info.avatar.as_mut() else {
+            return;
+        };
+        if !matches!(avatar.state, PhotoState::Pending) {
+            return;
+        }
+
+        avatar.state = PhotoState::Loading;
+        let command = TgCommand::DownloadAvatar {
+            peer: view.peer,
+            source: Box::new(avatar.source.clone()),
+        };
+        self.send(command);
     }
 
     // -- the chat action menu ------------------------------------------------
@@ -1519,7 +1568,7 @@ mod tests {
     use crate::telegram::TgEvent;
     use crate::test_support::{
         app, archived_dialog, channel, channel_dialog, dialog, drain, folder, gradient,
-        group_dialog, message, outgoing, page, peer, photo_message, user_full,
+        group_dialog, message, outgoing, page, peer, photo_message, thumb, user_full,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1630,6 +1679,98 @@ mod tests {
             app.dialogs.find(peer(1).id).unwrap().blocked,
             "the seed is one page of `contacts.getBlocked`, so past it a blocked user shows \
              `Block`; the profile is a fresher server answer for this one peer"
+        );
+    }
+
+    /// A profile carrying a picture that has not been fetched yet.
+    fn profile_with_avatar() -> PeerInfo {
+        PeerInfo {
+            avatar: Some(
+                crate::state::media::avatar_ref(&crate::test_support::profile_photo(&[thumb(
+                    "x", 160, 160,
+                )]))
+                .expect("the fixture picture is downloadable"),
+            ),
+            ..user_full("Alice")
+        }
+    }
+
+    #[test]
+    fn a_profile_with_a_picture_asks_for_it_once() {
+        let (mut app, mut rx) = opened_profile();
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(profile_with_avatar())),
+        });
+
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [TgCommand::DownloadAvatar { peer: asked, .. }] if asked.id == peer(1).id
+        ));
+    }
+
+    #[test]
+    fn a_profile_with_no_picture_asks_for_nothing() {
+        let (mut app, mut rx) = opened_profile();
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(user_full("Alice"))),
+        });
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "there is nothing to fetch, and a request for a picture that does not exist would \
+             come back as an error the user never asked to see"
+        );
+    }
+
+    #[test]
+    fn an_avatar_that_arrives_is_ready_to_draw() {
+        let (mut app, _rx) = opened_profile();
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(profile_with_avatar())),
+        });
+        app.handle_event(TgEvent::AvatarLoaded {
+            peer: peer(1).id,
+            image: Some(gradient(160, 160)),
+        });
+
+        let InfoState::Ready(info) = &app.peer_info.as_ref().unwrap().state else {
+            panic!("the profile should be ready");
+        };
+        assert!(info.avatar.as_ref().unwrap().image().is_some());
+    }
+
+    #[test]
+    fn a_failed_avatar_download_is_terminal_rather_than_retried() {
+        let (mut app, mut rx) = opened_profile();
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(profile_with_avatar())),
+        });
+        drain(&mut rx);
+
+        app.handle_event(TgEvent::AvatarLoaded {
+            peer: peer(1).id,
+            image: None,
+        });
+
+        let InfoState::Ready(info) = &app.peer_info.as_ref().unwrap().state else {
+            panic!("the profile should be ready");
+        };
+        assert!(matches!(
+            info.avatar.as_ref().unwrap().state,
+            PhotoState::Failed
+        ));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the reserved box keeps its rows and shows initials; asking again would be a request \
+             per frame for a picture the server has already refused"
         );
     }
 

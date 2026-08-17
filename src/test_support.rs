@@ -112,6 +112,21 @@ pub fn photo_media(sizes: &[tl::enums::PhotoSize]) -> Media {
     Media::from_raw(raw).expect("a photo is always renderable as media")
 }
 
+/// A profile photo as `users.getFullUser` delivers one: a bare `tl::enums::Photo` rather than the
+/// `MessageMediaPhoto` a message carries.
+pub fn profile_photo(sizes: &[tl::enums::PhotoSize]) -> grammers_client::media::Photo {
+    grammers_client::media::Photo::from_raw(tl::enums::Photo::Photo(tl::types::Photo {
+        has_stickers: false,
+        id: 1,
+        access_hash: 1,
+        file_reference: Vec::new(),
+        date: 0,
+        sizes: sizes.to_vec(),
+        video_sizes: None,
+        dc_id: 2,
+    }))
+}
+
 pub fn document_media(
     mime: &str,
     resolution: Option<(i32, i32)>,

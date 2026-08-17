@@ -130,6 +130,7 @@ async fn actor_loop(mut actor: Actor, mut commands: mpsc::UnboundedReceiver<TgCo
             TgCommand::LoadMoreDialogs { archived: true } => actor.load_more_archived(),
             TgCommand::LoadFolders => actor.load_folders(),
             TgCommand::LoadPeerInfo { peer } => actor.load_peer_info(peer),
+            TgCommand::DownloadAvatar { peer, source } => actor.download_avatar(peer, source),
             TgCommand::OpenChat { peer } => actor.open_chat(peer),
             TgCommand::LoadOlderMessages { peer, before_id } => {
                 actor.load_older_messages(peer, before_id)
@@ -487,6 +488,28 @@ impl Actor {
             let _ = events.send(TgEvent::PhotoLoaded {
                 peer: peer.id,
                 message_id,
+                image,
+            });
+        });
+    }
+
+    fn download_avatar(&mut self, peer: PeerRef, source: Box<PhotoSource>) {
+        let client = self.client.clone();
+        let events = self.events.clone();
+
+        tokio::spawn(async move {
+            let image = match fetch_image(&client, &source).await {
+                Ok(image) => Some(Arc::new(image)),
+                Err(err) => {
+                    // No banner, like a photo download: the screen already says what happened by
+                    // falling back to the peer's initials.
+                    tracing::debug!(%err, "avatar download failed");
+                    None
+                }
+            };
+
+            let _ = events.send(TgEvent::AvatarLoaded {
+                peer: peer.id,
                 image,
             });
         });
