@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use grammers_client::media::{Document, Media, PhotoSize};
+use grammers_client::media::{Document, Media, Photo, PhotoSize};
 use image::DynamicImage;
 
 /// Largest edge worth downloading. The transcript renders into a handful of character cells, so
@@ -110,6 +110,25 @@ fn document_source(document: &Document) -> Option<(PhotoSource, (u32, u32))> {
     None
 }
 
+/// A peer's current profile picture, as a downloadable reference.
+///
+/// Deliberately shares `pick_thumb` with [`photo_ref`], the way `dialog_list::is_muted` is shared
+/// by the dialog seed and the live update: two functions choosing a source independently would
+/// eventually disagree about what "sized for a terminal" means.
+///
+/// `None` for a peer with no picture, and for `photoEmpty`, which has no sizes at all.
+pub fn avatar_ref(photo: &Photo) -> Option<PhotoRef> {
+    let (source, pixels) = pick_thumb(photo.thumbs())?;
+    Some(PhotoRef {
+        source,
+        pixels,
+        // Never printed: the info screen falls back to the peer's initials rather than a label,
+        // because a bordered box with `[photo]` in it reads as a broken picture.
+        label: "[photo]",
+        state: PhotoState::Pending,
+    })
+}
+
 /// Choose which thumbnail to download: the largest that still fits `MAX_SOURCE_EDGE`, falling
 /// back to the smallest available so an unusually sized photo still shows something.
 fn pick_thumb(thumbs: Vec<PhotoSize>) -> Option<(PhotoSource, (u32, u32))> {
@@ -175,6 +194,7 @@ pub fn media_label(media: &Media) -> &'static str {
 mod tests {
     use super::*;
     use crate::test_support::{document_media, photo_media, sticker_media, stripped_thumb, thumb};
+    use grammers_client::tl;
 
     fn source_pixels(media: &Media) -> Option<(u32, u32)> {
         photo_ref(media).map(|photo| photo.pixels)
@@ -282,5 +302,50 @@ mod tests {
             "a PDF has a page thumbnail, but showing it as the message would be misleading"
         );
         assert_eq!(media_label(&media), "[file]");
+    }
+
+    /// A profile photo as `users.getFullUser` delivers one: a bare `tl::enums::Photo` rather than
+    /// the `MessageMediaPhoto` a message carries.
+    fn profile_photo(sizes: &[tl::enums::PhotoSize]) -> grammers_client::media::Photo {
+        grammers_client::media::Photo::from_raw(tl::enums::Photo::Photo(tl::types::Photo {
+            has_stickers: false,
+            id: 1,
+            access_hash: 1,
+            file_reference: Vec::new(),
+            date: 0,
+            sizes: sizes.to_vec(),
+            video_sizes: None,
+            dc_id: 2,
+        }))
+    }
+
+    #[test]
+    fn an_avatar_picks_a_thumbnail_the_same_way_a_message_photo_does() {
+        let avatar = avatar_ref(&profile_photo(&[
+            crate::test_support::thumb("a", 160, 160),
+            crate::test_support::thumb("x", 640, 640),
+        ]))
+        .expect("a profile photo with sizes is downloadable");
+
+        assert_eq!(
+            avatar.pixels,
+            (640, 640),
+            "sharing `pick_thumb` with `photo_ref` is what keeps the two from disagreeing about \
+             what a terminal-sized source is"
+        );
+        assert!(matches!(avatar.state, PhotoState::Pending));
+    }
+
+    #[test]
+    fn an_empty_profile_photo_yields_no_avatar_rather_than_an_empty_box() {
+        let empty = grammers_client::media::Photo::from_raw(tl::enums::Photo::Empty(
+            tl::types::PhotoEmpty { id: 0 },
+        ));
+
+        assert!(
+            avatar_ref(&empty).is_none(),
+            "a `photoEmpty` has no sizes at all; reserving a box for it would leave a hole above \
+             the fields with nothing ever arriving to fill it"
+        );
     }
 }

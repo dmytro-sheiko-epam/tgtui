@@ -9,9 +9,10 @@
 //! nothing beside it.
 
 use chrono::{DateTime, Local, TimeZone, Utc};
+use grammers_client::media::Photo;
 use grammers_client::tl;
 
-use crate::state::media::PhotoRef;
+use crate::state::media::{PhotoRef, avatar_ref};
 
 /// A profile, ready to draw.
 #[derive(Debug, Default)]
@@ -110,6 +111,10 @@ pub fn user(full: &tl::types::UserFull, user: Option<&tl::types::User>) -> PeerI
         (full.common_chats_count > 0).then(|| format!("{} in common", full.common_chats_count)),
     );
     info.push("Peer id", Some(full.id.to_string()));
+    info.avatar = full
+        .profile_photo
+        .clone()
+        .and_then(|photo| avatar_ref(&Photo::from_raw(photo)));
     info
 }
 
@@ -194,6 +199,10 @@ pub fn chat(full: &tl::types::ChatFull) -> PeerInfo {
     );
 
     info.push("Peer id", Some(full.id.to_string()));
+    info.avatar = full
+        .chat_photo
+        .clone()
+        .and_then(|photo| avatar_ref(&Photo::from_raw(photo)));
     info
 }
 
@@ -231,6 +240,7 @@ pub fn channel(full: &tl::types::ChannelFull) -> PeerInfo {
     // - `wallpaper`, `stargifts_count`, `boosts_applied` and the rest of the layer's ornaments
     //   have nothing to do with reading a conversation from a terminal.
     info.push("Peer id", Some(full.id.to_string()));
+    info.avatar = avatar_ref(&Photo::from_raw(full.chat_photo.clone()));
     info
 }
 
