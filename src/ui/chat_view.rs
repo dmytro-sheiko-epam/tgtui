@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, ChatViewMetrics, Focus};
 use crate::state::chat_buffer::{ChatBuffer, ChatMessage, ReplyPreview};
-use crate::ui::images::{ImageStore, inline_rows};
+use crate::ui::images::{ImageKey, ImageStore, inline_rows};
 use crate::ui::text::wrap;
 use crate::ui::widgets::pane;
 
@@ -179,7 +179,9 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App, images: &mut 
     // reserved, and the image widget marks its own cells skipped so the backend diff leaves
     // them alone afterwards.
     for placement in &transcript.images {
-        let Some(protocol) = images.protocol(placement.message_id, placement.size) else {
+        let Some(protocol) =
+            images.protocol(ImageKey::Message(placement.message_id), placement.size)
+        else {
             continue;
         };
         let Some(position) = placement.position(start, viewport) else {
@@ -358,9 +360,14 @@ fn build_transcript(
         // doesn't shift when the download lands. The label sits on the top row until it does,
         // and stays there for good if the picture can't be drawn at all.
         let reserved = message.photo.as_ref().and_then(|photo| {
-            let drawn = photo
-                .image()
-                .and_then(|image| images.prepare(message.id, image, body_width as u16, max_rows));
+            let drawn = photo.image().and_then(|image| {
+                images.prepare(
+                    ImageKey::Message(message.id),
+                    image,
+                    body_width as u16,
+                    max_rows,
+                )
+            });
             // No way to show it is no reason to fetch it: with images off, or in a terminal
             // that reported no graphics, media stays a label and costs no bandwidth.
             let size =

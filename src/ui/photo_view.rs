@@ -9,7 +9,7 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 
 use crate::app::App;
 use crate::state::media::{PhotoRef, PhotoState};
-use crate::ui::images::ImageStore;
+use crate::ui::images::{ImageKey, ImageStore};
 use crate::ui::text::wrap;
 use crate::ui::widgets::pane;
 
@@ -43,12 +43,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, images: &mut ImageSt
 
     let drawn = photo
         .image()
-        .and_then(|image| images.prepare(message_id, image, inner.width, picture_rows))
+        .and_then(|image| {
+            images.prepare(
+                ImageKey::Message(message_id),
+                image,
+                inner.width,
+                picture_rows,
+            )
+        })
         .map(|size| (size, image_area(inner, size, picture_rows)));
 
     match drawn {
         Some((size, picture)) => {
-            if let Some(protocol) = images.protocol(message_id, size) {
+            if let Some(protocol) = images.protocol(ImageKey::Message(message_id), size) {
                 let offset = SignedPosition::from((
                     (picture.x - inner.x) as i16,
                     (picture.y - inner.y) as i16,

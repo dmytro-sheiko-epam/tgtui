@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use grammers_session::types::PeerId;
 use image::DynamicImage;
 use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
@@ -14,6 +15,17 @@ use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FontSize, Resize};
 
 use crate::config::ImageMode;
+
+/// What a cached encoding belongs to.
+///
+/// Was a bare message id until profiles arrived. An avatar has no message to be keyed by, and a
+/// synthetic id would collide with a real one the moment a chat's ids reached it — channel ids
+/// restart at 1 per channel, so there is no id space that is safely out of the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageKey {
+    Message(i32),
+    Avatar(PeerId),
+}
 
 /// Encoded pictures kept at once. A picture on screen is held at two sizes — inline and, once
 /// the viewer has shown it, full screen — so this leaves room for both without re-encoding as
@@ -34,9 +46,9 @@ pub struct ImageStore {
     /// `None` when images are switched off or the terminal could not be queried; everything
     /// below then reports "no picture" and the transcript falls back to labels.
     picker: Option<Picker>,
-    /// Keyed by size as well as message, because the same picture is held inline *and* full
+    /// Keyed by size as well as picture, because the same picture is held inline *and* full
     /// screen; one entry per message would re-encode on every trip into the viewer and back.
-    cache: HashMap<(i32, Size), Cached>,
+    cache: HashMap<(ImageKey, Size), Cached>,
     /// Ticks on every lookup, so the least recently drawn entry is the one evicted.
     clock: u64,
 }
@@ -116,7 +128,7 @@ impl ImageStore {
     /// shift the rows underneath it.
     pub fn prepare(
         &mut self,
-        id: i32,
+        id: ImageKey,
         image: &Arc<DynamicImage>,
         max_cols: u16,
         max_rows: u16,
@@ -148,7 +160,7 @@ impl ImageStore {
         ) {
             Ok(protocol) => protocol,
             Err(err) => {
-                tracing::debug!(%err, id, "could not encode image for this terminal");
+                tracing::debug!(%err, ?id, "could not encode image for this terminal");
                 return None;
             }
         };
@@ -165,7 +177,7 @@ impl ImageStore {
     }
 
     /// The encoded picture for a message at a given size, once `prepare` has built it.
-    pub fn protocol(&self, id: i32, size: Size) -> Option<&SlicedProtocol> {
+    pub fn protocol(&self, id: ImageKey, size: Size) -> Option<&SlicedProtocol> {
         self.cache.get(&(id, size)).map(|cached| &cached.protocol)
     }
 
@@ -234,7 +246,9 @@ mod tests {
     fn an_image_that_already_fits_keeps_its_natural_size() {
         let mut store = ImageStore::for_tests();
 
-        let size = store.prepare(1, &image(100, 200), 80, ROWS).unwrap();
+        let size = store
+            .prepare(ImageKey::Message(1), &image(100, 200), 80, ROWS)
+            .unwrap();
 
         assert_eq!(
             (size.width, size.height),
@@ -248,7 +262,9 @@ mod tests {
         let mut store = ImageStore::for_tests();
 
         // 40 rows tall at its natural size, past the cap.
-        let size = store.prepare(1, &image(100, 800), 80, ROWS).unwrap();
+        let size = store
+            .prepare(ImageKey::Message(1), &image(100, 800), 80, ROWS)
+            .unwrap();
 
         assert!(
             size.height <= ROWS,
@@ -261,8 +277,12 @@ mod tests {
     fn a_taller_viewport_earns_a_taller_picture() {
         let mut store = ImageStore::for_tests();
 
-        let small = store.prepare(1, &image(100, 800), 80, 8).unwrap();
-        let large = store.prepare(1, &image(100, 800), 80, 32).unwrap();
+        let small = store
+            .prepare(ImageKey::Message(1), &image(100, 800), 80, 8)
+            .unwrap();
+        let large = store
+            .prepare(ImageKey::Message(1), &image(100, 800), 80, 32)
+            .unwrap();
 
         assert!(
             large.height > small.height,
@@ -296,7 +316,9 @@ mod tests {
     fn a_wide_image_is_clamped_to_the_columns_it_was_offered() {
         let mut store = ImageStore::for_tests();
 
-        let size = store.prepare(1, &image(2000, 100), 30, ROWS).unwrap();
+        let size = store
+            .prepare(ImageKey::Message(1), &image(2000, 100), 30, ROWS)
+            .unwrap();
 
         assert!(
             size.width <= 30,
@@ -311,7 +333,9 @@ mod tests {
 
         // The dimensions Telegram states before the download, and the decoded image after.
         let held = store.reserve((900, 1600), 40, ROWS).unwrap();
-        let used = store.prepare(1, &image(900, 1600), 40, ROWS).unwrap();
+        let used = store
+            .prepare(ImageKey::Message(1), &image(900, 1600), 40, ROWS)
+            .unwrap();
 
         assert_eq!(
             held, used,
@@ -324,8 +348,16 @@ mod tests {
         let mut store = ImageStore::disabled();
 
         assert!(store.reserve((100, 200), 80, ROWS).is_none());
-        assert!(store.prepare(1, &image(100, 200), 80, ROWS).is_none());
-        assert!(store.protocol(1, Size::new(10, 10)).is_none());
+        assert!(
+            store
+                .prepare(ImageKey::Message(1), &image(100, 200), 80, ROWS)
+                .is_none()
+        );
+        assert!(
+            store
+                .protocol(ImageKey::Message(1), Size::new(10, 10))
+                .is_none()
+        );
     }
 
     #[test]
@@ -347,13 +379,15 @@ mod tests {
         let mut store = ImageStore::for_tests();
         let image = image(100, 200);
 
-        let size = store.prepare(1, &image, 80, ROWS).unwrap();
-        let first = store.cache[&(1, size)].used;
-        store.prepare(1, &image, 80, ROWS);
+        let size = store
+            .prepare(ImageKey::Message(1), &image, 80, ROWS)
+            .unwrap();
+        let first = store.cache[&(ImageKey::Message(1), size)].used;
+        store.prepare(ImageKey::Message(1), &image, 80, ROWS);
 
         assert_eq!(store.cache.len(), 1);
         assert!(
-            store.cache[&(1, size)].used > first,
+            store.cache[&(ImageKey::Message(1), size)].used > first,
             "a second lookup must refresh the entry rather than re-encode it"
         );
     }
@@ -364,12 +398,15 @@ mod tests {
         let image = image(400, 800);
 
         // How the transcript and then the full-screen viewer ask for the same photo.
-        let inline = store.prepare(1, &image, 40, 12).unwrap();
-        let full = store.prepare(1, &image, 120, 40).unwrap();
+        let inline = store.prepare(ImageKey::Message(1), &image, 40, 12).unwrap();
+        let full = store
+            .prepare(ImageKey::Message(1), &image, 120, 40)
+            .unwrap();
 
         assert_ne!(inline, full);
         assert!(
-            store.protocol(1, inline).is_some() && store.protocol(1, full).is_some(),
+            store.protocol(ImageKey::Message(1), inline).is_some()
+                && store.protocol(ImageKey::Message(1), full).is_some(),
             "both must survive, or every trip in and out of the viewer re-encodes"
         );
     }
@@ -379,8 +416,12 @@ mod tests {
         let mut store = ImageStore::for_tests();
         let image = image(100, 200);
 
-        let wide = store.prepare(1, &image, 80, ROWS).unwrap();
-        let narrow = store.prepare(1, &image, 5, ROWS).unwrap();
+        let wide = store
+            .prepare(ImageKey::Message(1), &image, 80, ROWS)
+            .unwrap();
+        let narrow = store
+            .prepare(ImageKey::Message(1), &image, 5, ROWS)
+            .unwrap();
 
         assert_eq!(wide.width, 10);
         assert_eq!(
@@ -395,15 +436,23 @@ mod tests {
         let mut sizes = Vec::new();
 
         for id in 0..(MAX_CACHED_PROTOCOLS as i32 * 2) {
-            sizes.push(store.prepare(id, &image(100, 200), 80, ROWS).unwrap());
+            sizes.push(
+                store
+                    .prepare(ImageKey::Message(id), &image(100, 200), 80, ROWS)
+                    .unwrap(),
+            );
         }
 
         assert_eq!(store.cache.len(), MAX_CACHED_PROTOCOLS);
         assert!(
-            store.protocol(0, sizes[0]).is_none(),
+            store.protocol(ImageKey::Message(0), sizes[0]).is_none(),
             "the least recently drawn picture is the one that goes"
         );
         let last = MAX_CACHED_PROTOCOLS * 2 - 1;
-        assert!(store.protocol(last as i32, sizes[last]).is_some());
+        assert!(
+            store
+                .protocol(ImageKey::Message(last as i32), sizes[last])
+                .is_some()
+        );
     }
 }
