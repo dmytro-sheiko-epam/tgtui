@@ -153,7 +153,6 @@ pub struct PeerInfoView {
     pub peer: PeerRef,
     /// From the dialog row, so the title is right before the fetch lands.
     pub name: String,
-    pub kind: DialogKind,
     pub state: InfoState,
     /// Lines scrolled *past the top*. The opposite of `ChatBuffer.scroll`, which counts up from
     /// the bottom — deliberately, because a profile is a fixed-length document read top-down,
@@ -940,7 +939,6 @@ impl App {
         self.peer_info = Some(PeerInfoView {
             peer,
             name: summary.name.clone(),
-            kind: summary.kind,
             state: InfoState::Loading,
             scroll: 0,
         });
@@ -1568,7 +1566,7 @@ mod tests {
     use crate::telegram::TgEvent;
     use crate::test_support::{
         app, archived_dialog, channel, channel_dialog, dialog, drain, folder, gradient,
-        group_dialog, message, outgoing, page, peer, photo_message, thumb, user_full,
+        group_dialog, message, outgoing, page, peer, photo_message, profile_with_avatar, user_full,
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1680,19 +1678,6 @@ mod tests {
             "the seed is one page of `contacts.getBlocked`, so past it a blocked user shows \
              `Block`; the profile is a fresher server answer for this one peer"
         );
-    }
-
-    /// A profile carrying a picture that has not been fetched yet.
-    fn profile_with_avatar() -> PeerInfo {
-        PeerInfo {
-            avatar: Some(
-                crate::state::media::avatar_ref(&crate::test_support::profile_photo(&[thumb(
-                    "x", 160, 160,
-                )]))
-                .expect("the fixture picture is downloadable"),
-            ),
-            ..user_full("Alice")
-        }
     }
 
     #[test]

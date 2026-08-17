@@ -14,7 +14,7 @@ use crate::state::chat_buffer::ChatMessage;
 use crate::state::dialog_actions::DialogKind;
 use crate::state::dialog_list::DialogSummary;
 use crate::state::folders::{Folder, FolderRule};
-use crate::state::media::{PhotoState, photo_ref};
+use crate::state::media::{PhotoState, avatar_ref, photo_ref};
 use crate::state::peer_info::{InfoRow, PeerInfo};
 use crate::telegram::TgCommand;
 
@@ -519,6 +519,17 @@ pub fn user_full(name: &str) -> PeerInfo {
         }],
         avatar: None,
         blocked: None,
+    }
+}
+
+/// The same profile, carrying a picture that has not been fetched yet.
+pub fn profile_with_avatar() -> PeerInfo {
+    PeerInfo {
+        avatar: Some(
+            avatar_ref(&profile_photo(&[thumb("x", 160, 160)]))
+                .expect("the fixture picture is downloadable"),
+        ),
+        ..user_full("Alice")
     }
 }
 

@@ -72,6 +72,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if matches!(app.screen, Screen::Main) {
         let hints = if app.viewer.is_some() {
             " ←/→ previous/next picture · Esc close"
+        } else if app.peer_info.is_some() {
+            // `handle_peer_info_key` swallows everything else, so offering the compose box's keys
+            // here would be a lie about what the keyboard does — the same reason the menu drops
+            // its own keys while a confirmation is up.
+            " ↑/↓ scroll · Esc close"
         } else if app.forward.is_some() {
             " type to search · ↑/↓ select · Enter forward · Esc cancel"
         } else if let Some(menu) = &app.menu {
@@ -119,7 +124,8 @@ mod tests {
     use crate::state::dialog_list::FolderTab;
     use crate::telegram::TgEvent;
     use crate::test_support::{
-        app, channel_dialog, dialog, folder, loaded_photo_message, message, page, peer,
+        app, channel_dialog, dialog, folder, gradient, loaded_photo_message, message, page, peer,
+        profile_with_avatar,
     };
 
     /// Render an app to a fixed-size test terminal and return the screen as text.
@@ -623,6 +629,141 @@ mod tests {
                 .draw(|frame| draw(frame, &mut app, &mut images))
                 .unwrap();
         }
+    }
+
+    // -- the profile screen --------------------------------------------------
+
+    /// The selected chat's profile, open and answered, with a picture not yet downloaded.
+    fn with_profile(app: &mut App) {
+        app.open_peer_info();
+        app.handle_event(TgEvent::PeerInfoLoaded {
+            peer: peer(1).id,
+            info: Ok(Box::new(profile_with_avatar())),
+        });
+    }
+
+    /// Which row a piece of text landed on, so two frames can be compared for movement.
+    fn row_of(screen: &str, needle: &str) -> Option<usize> {
+        screen.lines().position(|line| line.contains(needle))
+    }
+
+    #[test]
+    fn the_profile_fills_the_screen_and_hides_the_chat_list() {
+        let mut app = loaded_app();
+        with_profile(&mut app);
+
+        let screen = screen(&mut app);
+
+        assert!(
+            screen.contains("This is Alice."),
+            "the bio belongs on the profile:\n{screen}"
+        );
+        assert!(
+            screen.contains("Peer id"),
+            "the field table is missing:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Chats"),
+            "the profile is full screen, so the chat list must be gone:\n{screen}"
+        );
+        assert!(
+            screen.contains("Esc close"),
+            "the footer must say how to get out, and must not offer keys the screen swallows:\n\
+             {screen}"
+        );
+        assert!(
+            !screen.contains("Tab compose"),
+            "`handle_peer_info_key` swallows the compose keys, so advertising them would be a \
+             lie about what the keyboard does:\n{screen}"
+        );
+    }
+
+    /// The invariant the whole `reserve`/`prepare` design exists for, on this screen: the header
+    /// claims the avatar's box from its *stated* pixel size, so the picture landing must not move
+    /// a single field.
+    #[test]
+    fn the_fields_do_not_move_when_the_profile_picture_arrives() {
+        let mut app = loaded_app();
+        with_profile(&mut app);
+
+        let before = painted(&mut app, 80, 24);
+        app.handle_event(TgEvent::AvatarLoaded {
+            peer: peer(1).id,
+            image: Some(gradient(160, 160)),
+        });
+        let after = painted(&mut app, 80, 24);
+
+        assert!(
+            after.contains('▀') || after.contains('▄'),
+            "the picture never reached the buffer, so this proves nothing:\n{after}"
+        );
+        for field in ["This is Alice.", "Peer id"] {
+            assert_eq!(
+                row_of(&before, field),
+                row_of(&after, field),
+                "{field:?} moved when the picture arrived; the box is claimed before the \
+                 download precisely so the reader's eyes stay put:\n{before}\n{after}"
+            );
+        }
+    }
+
+    /// `AVATAR_ROWS` is an absolute cap that knows nothing about how tall the terminal is, so a
+    /// short one has to clamp the picture to the rows the layout actually granted.
+    #[test]
+    fn a_short_terminal_keeps_the_profile_picture_inside_the_pane() {
+        let mut app = loaded_app();
+        with_profile(&mut app);
+        app.handle_event(TgEvent::AvatarLoaded {
+            peer: peer(1).id,
+            image: Some(gradient(160, 160)),
+        });
+
+        let screen = painted(&mut app, 60, 10);
+
+        let border = screen.lines().nth(8).unwrap_or_default().to_string();
+        assert!(
+            !border.contains('▀') && !border.contains('▄'),
+            "the picture smeared over the pane border: {border:?}\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_profile_does_not_panic_in_a_terminal_with_no_room() {
+        let mut app = loaded_app();
+        with_profile(&mut app);
+        app.handle_event(TgEvent::AvatarLoaded {
+            peer: peer(1).id,
+            image: Some(gradient(160, 160)),
+        });
+
+        for (width, height) in [(20, 5), (40, 3), (200, 60), (10, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut images = ImageStore::for_tests();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut images))
+                .unwrap();
+        }
+    }
+
+    /// Scrolling is clamped against the profile the frame just measured, so walking off the end
+    /// must settle rather than empty the pane.
+    #[test]
+    fn scrolling_past_the_end_of_a_profile_settles_rather_than_blanking_it() {
+        let mut app = loaded_app();
+        with_profile(&mut app);
+        painted(&mut app, 80, 24);
+
+        for _ in 0..40 {
+            app.handle_key(key(crossterm::event::KeyCode::Down));
+            painted(&mut app, 80, 24);
+        }
+
+        let screen = painted(&mut app, 80, 24);
+        assert!(
+            screen.contains("Peer id"),
+            "the last field must stay on screen; blank rows would be indistinguishable from a \
+             failed render:\n{screen}"
+        );
     }
 
     #[test]

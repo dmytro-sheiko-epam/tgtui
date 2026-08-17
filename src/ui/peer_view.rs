@@ -171,8 +171,11 @@ fn draw_avatar(
         return;
     };
 
+    // Clamped to the rows the layout actually granted as well as to the ones the picture wants:
+    // `AVATAR_ROWS` knows nothing about how tall the terminal is, so on a very short one the box
+    // would otherwise smear half-blocks over the pane border and the footer below it.
     let area = Rect {
-        height: size.height.saturating_sub(scroll),
+        height: size.height.saturating_sub(scroll).min(area.height),
         ..area
     };
     if area.height == 0 {
@@ -184,6 +187,9 @@ fn draw_avatar(
         if images
             .prepare(ImageKey::Avatar(peer), image, size.width, size.height)
             .is_some()
+            // Looked up at the *reserved* size rather than at whatever `prepare` just returned:
+            // the reserved box is what the header was measured against, so a picture that encoded
+            // to some other size must go undrawn rather than move the fields under the reader.
             && let Some(protocol) = images.protocol(ImageKey::Avatar(peer), size)
         {
             // Sliced from above, so the rows of the picture that have scrolled past the top are
