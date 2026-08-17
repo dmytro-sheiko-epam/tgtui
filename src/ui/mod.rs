@@ -6,6 +6,7 @@ pub mod forward_picker;
 pub mod images;
 pub mod login;
 pub mod menu;
+pub mod peer_view;
 pub mod photo_view;
 pub mod text;
 pub mod widgets;
@@ -27,6 +28,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, images: &mut ImageStore) {
         // The viewer takes the whole body rather than floating over the panes: a picture worth
         // opening full screen is worth every column.
         Screen::Main if app.viewer.is_some() => photo_view::render(frame, body, app, images),
+        // Full screen like the viewer, and for the same reason: there is a picture and a
+        // paragraph to fit, and neither reads well in a popup sized to a menu.
+        Screen::Main if app.peer_info.is_some() => peer_view::render(frame, body, app, images),
         Screen::Main => {
             let [list_area, chat_area] =
                 Layout::horizontal([Constraint::Length(CHAT_LIST_WIDTH), Constraint::Min(20)])
